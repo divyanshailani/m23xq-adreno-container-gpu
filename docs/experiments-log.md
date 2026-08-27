@@ -151,3 +151,46 @@ confirms the shader is compute-bound, not memory-bound — as designed.
 ### Thermal note
 GPU temp during sustained 800 MHz load: 47°C → 65°C after ~2 minutes.
 Comfortably below throttle territory (~95°C); the stock cooling handles it.
+
+## 2026-08-27 — EXP-005: container GPU overhead + Samsung CPU cap check — **SUCCESS (both answers)**
+
+Two questions before Phase 3: (a) does Droidspaces' "mirror GPU nodes" mode add
+overhead vs bare-metal GPU access? (b) has Samsung capped the CPU?
+
+### (a) Container GPU overhead: ~0%
+
+Method: the GPU path is a privileged ioctl pipe (`/dev/kgsl-3d0`); any per-call
+container overhead (namespace/device-cgroup checks) would show up as per-dispatch
+cost that grows relative to compute as workload shrinks. So: run the v2 ILP
+benchmark at three workload sizes spanning 1000x:
+
+| Workload | Per-dispatch compute | GFLOPS |
+|---|---|---|
+| Full: 96 MB buffers, 200 iters | ~550 ms | 89.5 |
+| Small: 1 MB buffers, 2000 iters | ~10 ms | 89.11 |
+| Micro: 64 KB buffers, 5000 iters | ~0.2 ms | 84.82 |
+
+Throughput is flat across the range (only -5% at the extreme micro end, where
+per-dispatch CPU-side submission cost is ~µs and starts to matter for *any*
+Vulkan app, container or not). If the container added meaningful per-io or
+per-dispatch overhead, the micro case would have collapsed — it didn't.
+**The mirrored /dev/kgsl-3d0 behaves like a direct pipe; container tax on the
+GPU path is not measurable.**
+
+### (b) CPU cap: none
+
+- `policy0` (A55 little, cpus 0-5): `scaling_max_freq` = **1804800** (1.8 GHz — full spec)
+- `policy6` (A77 big, cpus 6-7): `scaling_max_freq` = **2208000** (2.2 GHz — full spec)
+- Under a sustained busy-loop load on all 8 cores, both clusters *reach* their
+  maxes simultaneously: little = 1804800, big = 2208000. Verified live.
+- Samsung's extra `cpufreq_limit` node looks alarming at first:
+  `ltl_max_freq=902400` (902 MHz), `ltl_min_lock=624000`, `hmp_boost_type=2`,
+  plus a `user_min 1248000` request row. But the load test proves it is **not
+  an active clamp** — the little cluster runs at 1804 MHz with that limit row
+  present. It's scheduler-guidance bookkeeping (HMP boost hints for interactive
+  ramp-up), and the `user_min` request had already been withdrawn by the time
+  of the test (requests table empty).
+
+**Conclusion: Samsung caps the GPU (430 MHz, bypassed in EXP-004) but not the
+CPU.** Both CPU clusters run at full SD750G spec; the GPU clock keeper remains
+the only frequency intervention needed for Phase 3/4.
