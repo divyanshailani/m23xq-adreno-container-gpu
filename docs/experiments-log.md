@@ -296,3 +296,29 @@ Full display pipeline: Droidspaces container → Termux:X11 → phone screen.
 - Hyprland as a client of the WayLandIE bridge (wl_compositor is capped at v5 in
   the bridge — same bump-to-6 patch as weston if aquamarine needs it).
 - end-4/dots-hyprland rice on top.
+
+## 2026-08-28 — EXP-009: Hyprland compositor live on the phone screen via WayLandIE — **SUCCESS**
+
+- **The flush deadlock**: Hyprland (aquamarine) queues its xdg-shell requests but
+  never flushes them — it polls the bridge socket for the `configure` event that
+  can only arrive after its own requests flush. `WAYLAND_DEBUG=1` proved it:
+  `get_xdg_surface`/`get_toplevel` logged as queued, no configure ever returned,
+  while a minimal test client on the SAME server got configure instantly
+  (all bind versions v1/v5/v6 — ruled out protocol versioning).
+- **Fix — bridge ping patch**: the bridge server now sends `xdg_wm_base.ping`
+  every 500 ms to all bound xdg_wm_base resources. The ping forces the nested
+  compositor to answer (pong), which flushes its queued requests. After the
+  patch: `New aquamarine output with name WAYLAND-1` → `New monitor: WAYLAND-1`
+  → swapchain reconfigured 1280x720 XR24.
+- Also bumped the bridge's `wl_compositor` global 5→6 (aquamarine's registry
+  validation requires ≥6 to match its bindings).
+- **RESULT**: **Hyprland desktop (teal logo wallpaper) rendering on the phone
+  screen** in landscape 2408x1080, through:
+  Hyprland (Arch container) → WayLandIE bridge → dmabuf → Android
+  SurfaceControl/Vulkan (Turnip via AdrenoTools) → display.
+  Chain verified by pixel probe: pure teal (0,212,210) logo live on screen.
+- Hyprland idles at ~0% CPU (GPU-composited, unlike the llvmpipe runs).
+- Artifacts: `waylandie/waylandie-wayland-bridge.patched.sh` (wl_compositor v6 +
+  periodic ping patch).
+- Known cosmetic: hyprland.conf `debug:verbose` option removed in 0.56 (warning
+  banner on screen until config reload).
