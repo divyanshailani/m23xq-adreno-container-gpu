@@ -235,3 +235,64 @@ Full display pipeline: Droidspaces container → Termux:X11 → phone screen.
 - Hyprland plan (next): lfdevs mesa-for-android-container has an official
   **archlinux_arm64** build; end-4/dots-hyprland depends on quickshell+qt6
   stack via AUR meta-packages.
+
+## 2026-08-28 — EXP-008: weston-dmabuf patch chain + WayLandIE zero-copy GPU present — **SUCCESS (vkcube on screen)**
+
+### Part A: the weston patch chain (Hyprland-on-X11 path, superseded)
+
+- **Module shadowing fixed**: patched `gl-renderer.so` in `/usr/local/lib/libweston-15/`
+  was never loaded — the distro module at `/usr/lib/libweston-15/` won. Fixed by
+  replacing the distro file (backup `.distro-bak`) AND `LD_LIBRARY_PATH=/usr/local/lib`
+  for `libweston-15.so`.
+- **AQ-FALLBACK executed**: `Using rendering device (fallback): /dev/dri/renderD128` —
+  weston now advertises dmabuf feedback; aquamarine builds a GBM allocator
+  (`Created a GBM allocator with drm fd 17`). Hyprland reached "Output WAYLAND-1:
+  initialized".
+- **Three version bumps in weston source** were needed for aquamarine's newer protocol
+  bindings: `wl_compositor` 5→6 (compositor.c:9971), `wl_seat` cap 7→interface version
+  (input.c:4343), `xdg_wm_base` 5→6 (xdg-shell.c:49). All bind-handler safe (features
+  gated by `wl_resource_get_version`).
+- **Monitor fix**: `monitor=WAYLAND-1,1280x720@60,0x0,1` in hyprland.conf stopped the
+  "NO PREFERRED MODE" retry loop (the X11 backend reports no modes).
+- **THE WALL — zink present on EGL/X11 is broken**: every "working" screen was actually
+  the X window *background pixel* (0x2288ff / 0x004400 / 0x4400 — verified by exact
+  color match). Server-side `XGetImage` proved: GLX+zink presents (0xe633cc magenta ✓),
+  EGL+zink presents nothing (window bg only). Root cause chain:
+  Termux:X11's DRI3 `open` returns BadMatch (no DRM device to hand out) →
+  kopper's swapchain silently drops presents. `LIBGL_KOPPER_DRI2`/`_DISABLE` don't help.
+  GBM+zink separately fails ("failed to choose pdev") because Turnip reports
+  `hasRender=0` in `VkPhysicalDeviceDrmPropertiesEXT` (probe: renderD128 is 226:128).
+  EGL *device* platform + zink works — but Hyprland creates its display from the
+  GBM fd, which poisons the pdev match.
+
+### Part B: WayLandIE — dmabuf→SurfaceControl bridge (the working GPU path)
+
+- Replaced Termux:X11 with **WayLandIE** (github.com/AstroCODEsky/WayLandIE):
+  Linux Wayland server → dmabuf fd over abstract socket → Android
+  SurfaceControl/Vulkan presenter. Zero CPU copies ("final-copy=forbidden").
+- **macOS build ported** (build-apk.macos.sh): SDK 36 + build-tools 36.1.0 +
+  NDK r29 on the SSD; aapt2/d8/javac/zipalign/apksigner replace the PowerShell flow.
+- **Droidspaces netns fix**: the bridge socket `waylandie.display.bridge.v1` is an
+  abstract socket — invisible from the NAT'd container. Switched arch container to
+  `net_mode=host` in container.config (abstract sockets are netns-scoped).
+- **Patch 1 — Android 14 SurfaceControl**: the presenter hard-required
+  `ASurfaceTransaction_setBufferWithRelease` (API 35+; absent in our libandroid).
+  Patched to fall back to `ASurfaceTransaction_setBuffer` + `setOnComplete`
+  (API 29+), using present-completion as the release point.
+- **Patch 2 — libadrenotools bundling**: built bylaws/libadrenotools with NDK r29
+  (cmake + android.toolchain, BUILD_SHARED_LIBS=ON) and bundled `libadrenotools.so`
+  + 4 hook libs into the APK lib dir.
+- **Driver**: Turnip v26.3.0-R4 (StevenMXZ/Adreno-Tools-Drivers) installed as
+  `vulkan.waylandie.a8xx.so` in `/data/user/0/io.waylandie.display/files/adrenotools-driver/`
+  (chown to the app's uid — the status port reports the canonical path).
+- **RESULT**: `vkcube --wsi wayland` → **62.3 fps, zero-copy dmabuf, frame 779+,
+  LunarG cube visible on the phone screen**, 1280x720 → 2408x1080 @ 120 Hz.
+  Bridge verdict: pass, 474 frames / 9 s, avg present 16.25 ms, failures 0.
+- Artifacts: `waylandie/build-apk.macos.sh`,
+  `waylandie/waylandie_display_native.android14.patched.c`.
+
+### Next
+
+- Hyprland as a client of the WayLandIE bridge (wl_compositor is capped at v5 in
+  the bridge — same bump-to-6 patch as weston if aquamarine needs it).
+- end-4/dots-hyprland rice on top.
