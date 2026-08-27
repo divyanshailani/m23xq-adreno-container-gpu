@@ -194,3 +194,44 @@ GPU path is not measurable.**
 **Conclusion: Samsung caps the GPU (430 MHz, bypassed in EXP-004) but not the
 CPU.** Both CPU clusters run at full SD750G spec; the GPU clock keeper remains
 the only frequency intervention needed for Phase 3/4.
+
+## 2026-08-28 — EXP-006: X11 desktop in container — **SUCCESS**
+
+Full display pipeline: Droidspaces container → Termux:X11 → phone screen.
+
+- Termux:X11 nightly universal APK installed; X server started headless via
+  `app_process` + shell-loader (loader.apk) with the full Java env from the
+  proven integrity-stack script (BOOTCLASSPATH etc).
+- **Socket placement is the trick**: X server TMPDIR = `/data/data/com.termux/files/usr/tmp`
+  (the path Droidspaces' `enable_termux_x11` bridge expects); XKB_CONFIG_ROOT
+  staged at `/data/local/tmp/xkb` (host-local copy — breaks the container/X-server
+  start-order circularity: server no longer needs the container rootfs mounted).
+- Boot order that works: stop container → start X server → start container
+  (bridge bind-mounts `X5` into the container's tmpfs `/tmp/.X11-unix/`).
+  WARNING: container `stop` wipes the X5 socket — restart the X server between
+  stop and start.
+- Result: `xset`/`xrandr` work in-container (1080x2106 @ 119.89Hz),
+  **glxgears ~104 FPS on FD619 (freedreno GL 4.6, DRI3, direct rendering)**.
+- **Wayland nesting proven**: `weston --backend=x11-backend.so` runs on :5 with
+  FD619 GLES 3.2 — the chain for Hyprland (aquamarine has no X11 backend; it
+  must nest inside Weston's Wayland).
+
+## 2026-08-28 — EXP-007: Arch/Hyprland attempt + shutdown incident — **BLOCKED / RECOVERED**
+
+- ArchLinuxARM aarch64 rootfs: **systemd 261 refuses kernel 4.19** (needs ≥5.10;
+  systemd README v260+ confirms). PID1 exits: "Failed to determine whether /proc
+  is a mount point: Protocol driver not attached".
+- Workaround built: `--init` override → `custom_init=/usr/local/bin/mini-init`
+  in container.config (note: config key is `custom_init`, not `init`). Container
+  boots, but eth0 gets no IP (mini-init must run dhcpcd itself) — and my first
+  mini-init `wait $!` loop spun the loadavg to 4300.
+- **INCIDENT**: during no-shutdown-guard testing the phone powered off with zero
+  signs of life. Cause never logged; a PMIC battery-latch was cleared by the
+  owner (battery disconnect/reconnect). Recovery: samloader flash of the
+  byte-identical custom BOOT (no `--no-reboot`) auto-reboots out of Download
+  Mode — the button-less escape hatch, now in memory.
+- Post-recovery: aggressive auto-reboot watchdog REMOVED; only the reboot/svc
+  wrapper guards remain (boot-completed.d/95-no-shutdown.sh).
+- Hyprland plan (next): lfdevs mesa-for-android-container has an official
+  **archlinux_arm64** build; end-4/dots-hyprland depends on quickshell+qt6
+  stack via AUR meta-packages.
