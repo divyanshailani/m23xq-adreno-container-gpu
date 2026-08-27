@@ -32,7 +32,7 @@ controller** (DSI panel pipe), not the GPU. This means:
 See [docs/experiments-log.md](docs/experiments-log.md) for the full try/error history.
 
 - [x] Phase 0: Recon — kgsl node mirrored into container, DRM nodes identified as display-only
-- [ ] Phase 1: Mesa freedreno/Turnip (KGSL backend) install + Vulkan smoke test
+- [x] Phase 1: Mesa freedreno/Turnip (KGSL backend) install + Vulkan smoke test — **Adreno 619 enumerated via Turnip**
 - [ ] Phase 2: OpenGL via freedreno (or Zink-on-Turnip fallback), glmark2 benchmark
 - [ ] Phase 3: X/Wayland desktop in container (Termux:X11 or Anland as display)
 - [ ] Phase 4: Mirror the desktop to a Mac (VNC / waypipe / screen sharing) with GPU accel
