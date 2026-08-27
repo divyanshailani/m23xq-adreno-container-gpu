@@ -33,7 +33,7 @@ See [docs/experiments-log.md](docs/experiments-log.md) for the full try/error hi
 
 - [x] Phase 0: Recon — kgsl node mirrored into container, DRM nodes identified as display-only
 - [x] Phase 1: Mesa freedreno/Turnip (KGSL backend) install + Vulkan smoke test — **Adreno 619 enumerated via Turnip**
-- [ ] Phase 2: OpenGL via freedreno (or Zink-on-Turnip fallback), glmark2 benchmark
+- [x] Phase 2: OpenGL freedreno FD619 verified (GL 4.6 + ES 3.2); custom Vulkan compute bench: 22.45 GFLOPS sustained (EXP-002/003)
 - [ ] Phase 3: X/Wayland desktop in container (Termux:X11 or Anland as display)
 - [ ] Phase 4: Mirror the desktop to a Mac (VNC / waypipe / screen sharing) with GPU accel
 

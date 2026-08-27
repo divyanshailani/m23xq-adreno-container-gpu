@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x=256) in;
+layout(binding=0) buffer A { float a[]; };
+layout(binding=1) buffer B { float b[]; };
+layout(binding=2) buffer O { float o[]; };
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  float x = a[i];
+  float acc = 0.0;
+  for (int k = 0; k < 256; k++) {
+    acc = acc * 0.999f + x * 0.001f;
+    x = x * 1.0001f;
+  }
+  o[i] = acc + b[i];
+}

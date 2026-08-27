@@ -58,3 +58,50 @@ KGSL backend. This enumerating at all means the kgsl ioctls worked end-to-end
 **Next:** Phase 2 — OpenGL path (freedreno direct vs Zink-on-Turnip), glmark2
 benchmark vs the llvmpipe baseline; then Phase 3 display (Termux:X11 / Anland),
 Phase 4 mirror to Mac.
+
+## 2026-08-27 — EXP-002: OpenGL stack verification — **SUCCESS**
+
+`MESA_LOADER_DRIVER_OVERRIDE=kgsl eglinfo -B` (via GBM/surfaceless platform):
+
+```
+OpenGL core profile renderer: FD619 — version 4.6 (Core Profile) Mesa 26.3.0-devel
+OpenGL compatibility profile: FD619 — 4.6 (Compatibility Profile)
+OpenGL ES profile renderer: FD619 — OpenGL ES 3.2, GLSL ES 3.20
+```
+
+**Full freedreno GL stack on the real Adreno 619 — no Zink needed.** Notes:
+- The X11/GLX path (xvfb + glmark2) fails with `MESA-LOADER: failed to retrieve
+  device information` — expected: kgsl backend renders via GBM/surfaceless, not
+  GLX. X11 apps will need Zink-on-Turnip or a Wayland/native window system (Phase 3).
+- llvmpipe baseline (LIBGL_ALWAYS_SOFTWARE=1, xvfb, single scene): build ~102 FPS.
+
+## 2026-08-27 — EXP-003: headless Vulkan compute benchmark — **SUCCESS**
+
+vkmark KMS backend fails (`Failed to open active VT` — no VT inside the container;
+expected). Wrote a custom headless Vulkan compute benchmark instead
+(`scripts/gpubench.c` + `scripts/flops.comp`): 96 MB buffers x 3, workgroup 256,
+200 dispatch iterations of a dependency-chain FMA loop (256 iters x 2 FLOPs per
+invocation).
+
+```
+GPU0: Turnip Adreno (TM) 619
+mem type: 0 (device-local preferred)
+time: 114.785 s (200 iterations)
+GFLOPS: 22.45 (sustained, latency-bound shader — not peak)
+```
+
+Build/run (inside container):
+```
+glslangValidator -V flops.comp -o flops.spv   # + spv2inc.py to make the .inc
+gcc -O2 -o gpubench gpubench.c -lvulkan
+MESA_LOADER_DRIVER_OVERRIDE=kgsl \
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/freedreno_icd.json ./gpubench
+```
+
+Gotchas learned (cost debugging time — remember):
+- `VK_ICD_FILENAMES` must point at `freedreno_icd.json`; the loader otherwise
+  only surfaces `gfxstream_vk_icd.json` (Ubuntu's mesa-vulkan-drivers provides
+  the others but the default search finds gfxstream first in this image).
+- The GPU needs the kgsl override AND the freedreno ICD together.
+- File transfer to the container goes through `/sdcard` (visible at
+  `/storage/emulated/0` inside; container /tmp is isolated).
