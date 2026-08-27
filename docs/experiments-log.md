@@ -105,3 +105,49 @@ Gotchas learned (cost debugging time — remember):
 - The GPU needs the kgsl override AND the freedreno ICD together.
 - File transfer to the container goes through `/sdcard` (visible at
   `/storage/emulated/0` inside; container /tmp is isolated).
+
+## 2026-08-27 — EXP-004: benchmark honesty review + GPU clock cap investigation — **SUCCESS**
+
+A critique of EXP-003 (22.45 GFLOPS vs Adreno 619's ~486 GFLOPS theoretical
+peak) prompted a rigorous re-examination. Findings:
+
+### 1. The shader matters (v2 ILP benchmark)
+Original shader was a serial dependency chain (latency-bound). v2 uses 8
+independent accumulator chains (full ILP):
+
+| Shader | Clock | GFLOPS |
+|---|---|---|
+| v1 serial (EXP-003) | 430 MHz (stock cap) | 22.45 |
+| v2 ILP x8 | 430 MHz (stock cap) | 52.39 |
+| v2 ILP x8 | **800 MHz (clock keeper)** | **89.63 / 89.54** (reproducible) |
+
+### 2. The real story: Samsung's 430 MHz GPU clamp
+
+- Silicon supports it: `lagoon-gpu.dtsi` (SM7225/Adreno 619) speed-bin 169
+  table tops at **800 MHz** (850 in higher bins); `/sys/.../gpu_available_frequencies`
+  lists 800 MHz on the live device.
+- But `max_gpuclk` ships as **430 MHz** and a Samsung userspace component
+  (thermal policy / power HAL — thermal-engine.conf itself contains only modem
+  sections) actively *resets* `max_gpuclk` back to 430 after writes, though
+  `devfreq/max_freq` stays as set.
+- KonaBess-style dtb editing is unnecessary for us: we own the kernel source
+  and the runtime sysfs cap is writable by root. The reset is periodic, not
+  enforcement of a fused limit.
+
+### 3. The fix: GPU clock keeper (`boot-completed.d/91-gpu-clock-keeper.sh`)
+
+A 2-second loop re-asserting `max_gpuclk=800MHz` (+ devfreq max), started at
+boot via the ksud boot-completed stage (same mechanism as the integrity stack).
+Runs on the phone (host side), not in the container. Stop anytime with
+`touch /data/adb/gpu-clock-stop` or by removing the script.
+
+**Result: 89.6 GFLOPS sustained — 4x EXP-003's number and ~18% of the 486
+GFLOPS theoretical peak.** For a latency-bound FMA-loop shader on a mobile
+iGPU with no vendor tuning, this is a sane fraction of peak (peak assumes
+perfectly pipelined independent FMAs; real dependency chains + shared memory
+bandwidth + mobile thermals land well under it). The GB/s figure (0.31–0.53)
+confirms the shader is compute-bound, not memory-bound — as designed.
+
+### Thermal note
+GPU temp during sustained 800 MHz load: 47°C → 65°C after ~2 minutes.
+Comfortably below throttle territory (~95°C); the stock cooling handles it.
