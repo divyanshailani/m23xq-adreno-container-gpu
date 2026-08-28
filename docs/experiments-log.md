@@ -384,3 +384,56 @@ out of Download Mode — the proven escape hatch, ~50 s to ADB).
 
 - execs.lua already restored (a later ii-files.sh re-copy put the original
   25-line file back; verified).
+
+## 2026-08-28 — EXP-011: lfdevs Mesa + guarded GPU launch — freeze 3, silent-death signature — **ROOT-CAUSE NARROWED, no relaunch**
+
+### What was built (all verified before launch)
+- Installed lfdevs/mesa-for-android-container 26.3.0 (pacman -U: mesa, vulkan-freedreno,
+  vulkan-mesa-implicit-layers, vulkan-mesa-layers; stock 26.2.1 cached for rollback —
+  confirmed survived reboot in pacman DB).
+- GL probe gate: `eglinfo -B -p wayland` with `MESA_LOADER_DRIVER_OVERRIDE=kgsl`
+  → **`GL_RENDERER = FD619`** (real Adreno 619 via freedreno-over-KGSL, llvmpipe GONE).
+  The probe gate correctly ABORTED the first launch attempt when stock Mesa still
+  gave llvmpipe — the gate works.
+- Guards: host-side watchdog (kill Hyprland on >85% sustained CPU), v1 cgroup
+  cpu.shares=512 + memory.limit 2.5GB for enrollment, plain hyprland.conf (no end-4).
+- Bridge lifecycle bug found+fixed during staging: the WayLandIE bridge **exits when
+  its last client disconnects** (probe's eglinfo connect/disconnect killed it, and
+  launch-time pgrep false-positived on dying bridges). Launch script now checks for
+  a live socket dir and starts a fresh bridge, holding a client.
+
+### Freeze 3 — signature completely different from freeze 1
+- Onset: within ~15–60 s of "hyprland alive after 5s"; my next adb diagnostic
+  command hung. User confirmed same UI-stuck state. Recovered via the samloader
+  byte-identical BOOT flash escape (3rd successful use).
+- **Silent death**: NO system_app_anr, NO system_server_pre_watchdog, NO tombstones,
+  clean `Last boot reason: reboot` (freezes 1: Hyprland 94% CPU + pre-watchdog +
+  ANR storm + memory/io pressure 80–91%). Freeze 2 rechecked: also silent.
+  Only freeze 1 was "loud".
+- Kernel evidence: KMSG bootloader-only (Samsung LAST_KMSG never carries kernel
+  console on this device); pstore empty; /data/log has no new ramdump.
+- f2fs/power-pull ate all writes from the final ~minutes (watchdog script+log on
+  /data/local/tmp, launch scripts, hyprland-go.log) — so the watchdog likely never
+  fired (or fired without observable effect) and Hyprland's dying words are lost.
+- KGSL today (plain Android, clean boot): `reset_count` ticks ~6/min with
+  `ft_hang_intr_status=0` and zero kgsl dmesg lines → benign power-transition
+  counting; GPU healthy. fd holders: surfaceflinger/systemui/launcher (normal)
+  + com.droidspaces.app.
+
+### Working hypothesis (ranked)
+1. **Kernel-level KGSL contention**: freeze 3 was the first *sustained* run with
+   freedreno (container, direct /dev/kgsl-3d0 GL) + Turnip-via-AdrenoTools (bridge
+   APK present path) + SurfaceFlinger all submitting to the same KGSL. A driver
+   lockup there = silent total death, immune to userspace watchdogs. The successful
+   1-hour Hyprland run was llvmpipe (CPU) — only the bridge APK drove the GPU.
+2. Freeze 2 was probably still the llvmpipe+end-4 blur spin (freeze-1 mechanism),
+   just dying too fast for watchdog records to be written.
+3. Less likely: memcg enrollment interacting with ION allocations.
+
+### Next steps (design only — nothing launched)
+- **Kernel flight recorder first**: host-side daemon persisting dmesg tail +
+  kgsl state to /data/local/tmp with sync, running BEFORE any GPU experiment.
+- **Isolation control**: freedreno-over-bridge WITHOUT Hyprland (glmark2-es2-wayland
+  or the existing gles2-test binary), timeboxed, with recorder — cleanly separates
+  "freedreno via bridge" from "Hyprland" from "Hyprland+freedreno".
+- Only then: Hyprland plain-config relaunch, user present.
