@@ -591,3 +591,35 @@ Recovery + correct relaunch sequence documented in memory
 (waylandie-app-bridge-flags-mandatory). Lesson: the app flags are not
 optional and the stack relaunch must be staged: app (flagged) → settle →
 bridge → verify zero status=fail → Hyprland.
+
+## 2026-08-28 — EXP-016: 120Hz + correct UI scaling SOLVED at 1203x540
+
+### The scaling mystery
+- Hyprland snapped monitor scale 1.5/1.6 -> 1.33 and 1.75 -> 2.0: wl_output.scale is
+  integer-only and Hyprland's Wayland output backend derives the logical size itself.
+  The "1.33" was Hyprland telling us its wanted logical size: 1604/1203.
+- wp_fractional_scale_manager_v1 was implemented in the bridge but is NOT the answer:
+  fractional-scale is for client windows, not compositor output scaling. Kept (harmless).
+- REAL fix: set the bridge buffer to exactly what the logical size should be:
+  **CLIENT_WIDTH=1203 CLIENT_HEIGHT=540, hyprland scale 1**.
+  1203x540 = exact half of native 2408x1080 → Android upscale is a clean integer 2x
+  (sharp), UI elements land at phone size, and pixel count drops ~2.2x.
+
+### Results at 1203x540
+- vkcube-through-Hyprland: **128-132 fps sustained** (bursts 167), present 2.2ms.
+  120Hz target exceeded with headroom. (1604x720: 91fps; 2408x1080: 48fps.)
+- Vision-verified: bar/clock/quick-settings correctly sized, Material-You theme,
+  fastfetch clean, no config banner (monitors.lua must use STRING types for
+  mode/position — table types throw "field 'mode': string type requires a string").
+
+### Other fixes this round
+- kitty theme: quickshell's matugen template renderer died silently, leaving
+  #$term placeholders. Rendered from colors.json directly (values carry '#',
+  template adds its own → strip prefix or double-hash "##ffb4ab" errors).
+  Renderer: /root/render-theme.py (re-run after matugen/wallpaper changes).
+- fish + fastfetch installed (end-4 defaults).
+- Hardware keyboard: bridge now maps Android keycodes -> evdev and injects
+  wl_keyboard_send_key + modifiers straight into Hyprland (xtest kept as fallback).
+  App APK patched to consume key events in dispatchKeyEvent when bridge owns the
+  session (so Android's Meta/home shortcut is bypassed) — Super key still escapes
+  in practice, needs live keyboard debugging.

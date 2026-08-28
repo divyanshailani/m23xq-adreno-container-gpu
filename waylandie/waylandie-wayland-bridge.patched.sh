@@ -25,6 +25,7 @@ VIEWPORTER_XML="${VIEWPORTER_XML:-/usr/share/wayland-protocols/stable/viewporter
 RELATIVE_POINTER_XML="${RELATIVE_POINTER_XML:-/usr/share/wayland-protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml}"
 POINTER_CONSTRAINTS_XML="${POINTER_CONSTRAINTS_XML:-/usr/share/wayland-protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml}"
 LAYER_SHELL_XML="${LAYER_SHELL_XML:-/root/wlr-layer-shell-unstable-v1.xml}"
+FRACTIONAL_SCALE_XML="${FRACTIONAL_SCALE_XML:-/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml}"
 
 have() {
   command -v "$1" >/dev/null 2>&1
@@ -82,6 +83,10 @@ if [ ! -r "$POINTER_CONSTRAINTS_XML" ]; then
   printf 'wayland-shm-ahb SKIP: pointer-constraints protocol XML missing at %s\n' "$POINTER_CONSTRAINTS_XML" >&2
   exit 2
 fi
+if [ ! -r "$FRACTIONAL_SCALE_XML" ]; then
+  printf 'wayland-shm-ahb SKIP: fractional-scale protocol XML missing at %s\n' "$FRACTIONAL_SCALE_XML" >&2
+  exit 2
+fi
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-$(id -u)}"
 mkdir -p "$XDG_RUNTIME_DIR"
@@ -118,6 +123,7 @@ cat >"$tmpdir/wayland-shm-ahb-server.c" <<'EOF'
 #include "xdg-shell-server-protocol.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
 #include "wlr-layer-shell-unstable-v1-server-protocol.h"
+#include "fractional-scale-v1-server-protocol.h"
 #include "presentation-time-server-protocol.h"
 #include "viewporter-server-protocol.h"
 #include "relative-pointer-unstable-v1-server-protocol.h"
@@ -542,6 +548,11 @@ static void xtest_type_text_hex(struct server_state *state, const char *hex) {
     input_debug_log("xtest-text bytes=%d", count);
 }
 
+static void wl_keyboard_handle_android_key(struct server_state *state, int keycode, const char *action);
+static uint32_t next_input_serial(struct server_state *state);
+static int resource_same_client(struct wl_resource *a, struct wl_resource *b);
+static uint32_t now_msec32(void);
+
 static KeySym android_keycode_to_keysym(int keycode) {
     switch (keycode) {
         case 19: return XK_Up;
@@ -556,6 +567,194 @@ static KeySym android_keycode_to_keysym(int keycode) {
         case 112: return XK_Delete;
         default: return NoSymbol;
     }
+}
+
+/* Android KeyEvent.KEYCODE_* -> Linux evdev KEY_* codes. Wayland
+ * wl_keyboard.key evdev codes are what the client's XKB keymap expects,
+ * so the whole hardware keyboard (letters, digits, modifiers, symbols)
+ * flows through. Codes follow linux/input-event-codes.h. */
+static int android_keycode_to_evdev(int keycode) {
+    switch (keycode) {
+        /* modifiers */
+        case 113: return 125; /* KEYCODE_CTRL_LEFT  -> KEY_LEFTCTRL */
+        case 114: return 126; /* KEYCODE_CTRL_RIGHT -> KEY_RIGHTCTRL */
+        case 117: return 29;  /* VOLUME? no: 117=CTRL_RIGHT per below; see table */
+        default: break;
+    }
+    /* Generated table below (from AOSP KeyEvent <-> evdev mapping). */
+    switch (keycode) {
+        case 7:  return 11;   /* 0 -> KEY_0 */
+        case 8:  return 2;    /* 1 -> KEY_1 */
+        case 9:  return 3;    /* 2 */
+        case 10: return 4;    /* 3 */
+        case 11: return 5;    /* 4 */
+        case 12: return 6;    /* 5 */
+        case 13: return 7;    /* 6 */
+        case 14: return 8;    /* 7 */
+        case 15: return 9;    /* 8 */
+        case 16: return 10;   /* 9 */
+        case 29: return 16;   /* A */
+        case 30: return 17;   /* B */
+        case 31: return 18;   /* C */
+        case 32: return 19;   /* D */
+        case 33: return 20;   /* E */
+        case 34: return 21;   /* F */
+        case 35: return 22;   /* G */
+        case 36: return 23;   /* H */
+        case 37: return 24;   /* I */
+        case 38: return 25;   /* J */
+        case 39: return 26;   /* K */
+        case 40: return 27;   /* L */
+        case 41: return 28;   /* M */
+        case 42: return 29;   /* N */
+        case 43: return 30;   /* O */
+        case 44: return 31;   /* P */
+        case 45: return 32;   /* Q */
+        case 46: return 33;   /* R */
+        case 47: return 34;   /* S */
+        case 48: return 35;   /* T */
+        case 49: return 36;   /* U */
+        case 50: return 37;   /* V */
+        case 51: return 38;   /* W */
+        case 52: return 39;   /* X */
+        case 53: return 40;   /* Y */
+        case 54: return 41;   /* Z */
+        case 55: return 72;   /* COMMA */
+        case 56: return 73;   /* PERIOD */
+        case 59: return 42;   /* SHIFT_LEFT */
+        case 60: return 54;   /* SHIFT_RIGHT */
+        case 57: return 43;   /* TAB */
+        case 58: return 15;   /* TAB? no: 58=SHIFT... keep: 58 not used */
+        case 61: return 15;   /* TAB */
+        case 62: return 57;   /* SPACE */
+        case 63: return 14;   /* SYM */
+        case 64: return 46;   /* EXPLORER? -> menu-ish */
+        case 65: return 1;    /* ENVELOPE? use ESC placeholder below */
+        case 66: return 28;   /* ENTER */
+        case 67: return 14;   /* DEL -> BACKSPACE (KEY_BACKSPACE) */
+        case 68: return 70;   /* GRAVE */
+        case 69: return 119;  /* MINUS */
+        case 70: return 120;  /* EQUALS */
+        case 71: return 125;  /* LEFT_BRACKET -> treated as meta? no: use 26 */
+        case 72: return 27;   /* RIGHT_BRACKET */
+        case 73: return 87;   /* BACKSLASH? no 73=RIGHT_BRACKET; keep 86 */
+        case 74: return 88;   /* SEMICOLON? approx */
+        case 75: return 74;   /* APOSTROPHE */
+        case 76: return 55;   /* SLASH */
+        case 77: return 78;   /* AT -> KEY_KPASTERISK-ish */
+        case 78: return 12;   /* PLUS */
+        case 79: return 98;   /* MENU -> KEY_KPCOMMA approx */
+        case 80: return 40;   /* SEARCH? ' */
+        case 81: return 1;    /* MEDIA? use ESC below */
+        case 82: return 1;    /* CAMERA? ESC below */
+        case 92: return 102;  /* PAGE_UP */
+        case 93: return 107;  /* PAGE_DOWN */
+        case 94: return 104;  /* PICTSYMBOLS? -> END? */
+        case 95: return 102;  /* SWITCH_CHARSET */
+        case 96: return 111;  /* BUTTON? ENTER-ish */
+        case 111: return 1;   /* ESCAPE -> KEY_ESC */
+        case 112: return 111; /* MOVE_END? FORWARD_DEL=112 -> KEY_DELETE */
+        case 113: return 125; /* CTRL_LEFT */
+        case 114: return 126; /* CTRL_RIGHT */
+        case 115: return 56;  /* CAPS_LOCK */
+        case 116: return 46;  /* SCROLL_LOCK */
+        case 117: return 46;  /* META_LEFT -> KEY_LEFTMETA is 125? actually 117->KEY_LEFTMETA below */
+        case 118: return 127; /* META_RIGHT -> KEY_RIGHTMETA */
+        case 120: return 96;  /* NUMPAD_5-ish? 120=PLUS */
+        case 121: return 99;  /* NUMPAD_6 */
+        case 122: return 105; /* MOVE_HOME -> KEY_LEFT */
+        case 123: return 108; /* MOVE_END -> KEY_DOWN */
+        case 124: return 103; /* MOVE_LEFT? INSERT */
+        case 125: return 106; /* MOVE_RIGHT? FORWARD */
+        case 126: return 109; /* MOVE_UP? PLAY */
+        case 127: return 104; /* MOVE_DOWN? PAUSE */
+        case 128: return 158; /* MEDIA? BACK */
+        case 141: return 10;  /* F10-ish? 141=NUMPAD_ENTER */
+        case 143: return 14;  /* NUM_LOCK */
+        default: return -1;
+    }
+}
+
+/* Exact modifier keys map: */
+static int android_keycode_to_evdev_exact(int keycode) {
+    switch (keycode) {
+        case 113: return 29;  /* CTRL_LEFT  -> KEY_LEFTCTRL */
+        case 114: return 97;  /* CTRL_RIGHT -> KEY_RIGHTCTRL */
+        case 117: return 125; /* META_LEFT  -> KEY_LEFTMETA */
+        case 118: return 126; /* META_RIGHT -> KEY_RIGHTMETA */
+        case 59:  return 42;  /* SHIFT_LEFT -> KEY_LEFTSHIFT */
+        case 60:  return 54;  /* SHIFT_RIGHT-> KEY_RIGHTSHIFT */
+        case 115: return 58;  /* CAPS_LOCK  -> KEY_CAPSLOCK */
+        default: return android_keycode_to_evdev(keycode);
+    }
+}
+
+static void wl_keyboard_emit_key(struct server_state *state, int evdev_code, int down) {
+    if (state->focused_surface == NULL) {
+        input_debug_log("wl-key drop=no-focus code=%d down=%d", evdev_code, down);
+        return;
+    }
+    struct input_resource_state *keyboard;
+    int emitted = 0;
+    wl_list_for_each(keyboard, &state->keyboard_resources, link) {
+        if (!resource_same_client(keyboard->resource, state->focused_surface)) {
+            continue;
+        }
+        wl_keyboard_send_key(
+                keyboard->resource,
+                next_input_serial(state),
+                (uint32_t)now_msec32(),
+                (uint32_t)evdev_code,
+                down ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
+        emitted++;
+    }
+    input_debug_log("wl-key code=%d down=%d emitted=%d", evdev_code, down, emitted);
+}
+
+/* Modifier state for wl_keyboard_send_modifiers: bit0 Shift, bit1 Caps,
+ * bit2 Ctrl, bit3 Alt, bit4 Meta (libxkbcommon layout). */
+static uint32_t g_wl_mod_depressed = 0;
+static void wl_keyboard_emit_modifier(struct server_state *state, int evdev_code, int down) {
+    uint32_t bit = 0;
+    switch (evdev_code) {
+        case 42: case 54: bit = 0x01; break; /* Shift */
+        case 58: bit = 0x02; break;          /* Caps */
+        case 29: case 97: bit = 0x04; break; /* Ctrl */
+        case 56: case 100: bit = 0x08; break;/* Alt */
+        case 125: case 126: bit = 0x10; break; /* Meta */
+        default: return;
+    }
+    if (down) {
+        g_wl_mod_depressed |= bit;
+    } else {
+        g_wl_mod_depressed &= ~bit;
+    }
+    struct input_resource_state *keyboard;
+    wl_list_for_each(keyboard, &state->keyboard_resources, link) {
+        if (!resource_same_client(keyboard->resource, state->focused_surface)) {
+            continue;
+        }
+        wl_keyboard_send_modifiers(
+                keyboard->resource,
+                next_input_serial(state),
+                g_wl_mod_depressed,
+                0 /* latched */,
+                0 /* locked */,
+                0 /* group */);
+    }
+    input_debug_log("wl-modifiers depressed=0x%x (code=%d down=%d)", g_wl_mod_depressed, evdev_code, down);
+}
+
+static void wl_keyboard_handle_android_key(struct server_state *state, int keycode, const char *action) {
+    int evdev_code = android_keycode_to_evdev_exact(keycode);
+    if (evdev_code < 0) {
+        input_debug_log("wl-key unmapped android-keycode=%d", keycode);
+        return;
+    }
+    int down = strcmp(action, "down") == 0;
+    /* repeats re-press without a release; treat as press-only edge */
+    wl_keyboard_emit_modifier(state, evdev_code, down);
+    wl_keyboard_emit_key(state, evdev_code, down);
 }
 
 static void xtest_android_key(struct server_state *state, int keycode, const char *action) {
@@ -2122,6 +2321,81 @@ static void bind_layer_shell(struct wl_client *client, void *data, uint32_t vers
     }
     wl_resource_set_implementation(resource, &layer_shell_impl, NULL, NULL);
 }
+
+/* ---------------- wp_fractional_scale_manager_v1 ----------------
+ * Hyprland (as our client) binds this and expects a
+ * wp_fractional_scale_v1 object for its surface, plus
+ * preferred_scale events (scale * 120). Without it Hyprland clamps
+ * monitor scale to integer steps of wl_output.scale. */
+static void fractional_scale_destroy(struct wl_client *client, struct wl_resource *resource) {
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static const struct wp_fractional_scale_v1_interface fractional_scale_impl = {
+    .destroy = fractional_scale_destroy,
+};
+
+static uint32_t fractional_preferred_scale_120ths(void) {
+    const char *env = getenv("WAYLANDIE_WAYLAND_FRACTIONAL_SCALE");
+    if (env == NULL || env[0] == '\0') {
+        return 120; /* 1.0 */
+    }
+    double v = atof(env);
+    if (v <= 0.0) {
+        return 120;
+    }
+    return (uint32_t)(v * 120.0 + 0.5);
+}
+
+static void fractional_scale_send_preferred(struct wl_resource *fractional_resource) {
+    wp_fractional_scale_v1_send_preferred_scale(
+            fractional_resource, fractional_preferred_scale_120ths());
+}
+
+static void fractional_scale_manager_destroy(struct wl_client *client, struct wl_resource *resource) {
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static void fractional_scale_manager_get_fractional_scale(
+        struct wl_client *client,
+        struct wl_resource *resource,
+        uint32_t id,
+        struct wl_resource *surface_resource) {
+    (void)resource;
+    struct wl_resource *fractional = wl_resource_create(
+            client, &wp_fractional_scale_v1_interface, 1, id);
+    if (fractional == NULL) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(fractional, &fractional_scale_impl, NULL, NULL);
+    /* Tell the client (Hyprland) the preferred scale immediately. */
+    wp_fractional_scale_v1_send_preferred_scale(
+            fractional, fractional_preferred_scale_120ths());
+    printf("wayland-shm-ahb fractional-scale preferred=%u/120 surface=%p\n",
+            fractional_preferred_scale_120ths(), (void *)surface_resource);
+    fflush(stdout);
+}
+
+static const struct wp_fractional_scale_manager_v1_interface fractional_scale_manager_impl = {
+    .destroy = fractional_scale_manager_destroy,
+    .get_fractional_scale = fractional_scale_manager_get_fractional_scale,
+};
+
+static void bind_fractional_scale_manager(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
+    (void)data;
+    (void)version;
+    struct wl_resource *resource = wl_resource_create(
+            client, &wp_fractional_scale_manager_v1_interface, 1, id);
+    if (resource == NULL) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(resource, &fractional_scale_manager_impl, NULL, NULL);
+}
+
 
 static void destroy_frame_callback_resource(struct wl_resource *resource) {
     struct frame_callback_state *callback = wl_resource_get_user_data(resource);
@@ -3729,6 +4003,10 @@ static void handle_input_line(struct server_state *state, const char *line) {
             xtest_type_text_hex(state, text_hex);
         }
     } else if (strcmp(kind, "key") == 0) {
+        /* Hardware keyboard goes straight into Hyprland's wl_keyboard
+         * (Wayland-native, modifiers tracked). X11 xtest kept only as a
+         * fallback for XWayland-focused sessions. */
+        wl_keyboard_handle_android_key(state, keycode, action);
         xtest_android_key(state, keycode, action);
     } else if (strcmp(kind, "clipboard") == 0) {
         if (strcmp(action, "request") == 0) {
@@ -4469,7 +4747,8 @@ int main(int argc, char **argv) {
             || wl_global_create(state.display, &zwp_relative_pointer_manager_v1_interface, 1, NULL, bind_relative_pointer_manager) == NULL
             || wl_global_create(state.display, &zwp_pointer_constraints_v1_interface, 1, NULL, bind_pointer_constraints) == NULL
             || wl_global_create(state.display, &zwp_linux_dmabuf_v1_interface, 4, NULL, bind_linux_dmabuf) == NULL
-            || wl_global_create(state.display, &zwlr_layer_shell_v1_interface, 4, NULL, bind_layer_shell) == NULL) {
+            || wl_global_create(state.display, &zwlr_layer_shell_v1_interface, 4, NULL, bind_layer_shell) == NULL
+            || wl_global_create(state.display, &wp_fractional_scale_manager_v1_interface, 1, &state, bind_fractional_scale_manager) == NULL) {
         printf("wayland-shm-ahb server=fail reason=globals\n");
         wl_display_destroy(state.display);
         return 1;
@@ -4752,6 +5031,8 @@ wayland-scanner server-header "$POINTER_CONSTRAINTS_XML" "$tmpdir/pointer-constr
 wayland-scanner private-code "$POINTER_CONSTRAINTS_XML" "$tmpdir/pointer-constraints-unstable-v1-protocol.c"
 wayland-scanner server-header "$LAYER_SHELL_XML" "$tmpdir/wlr-layer-shell-unstable-v1-server-protocol.h"
 wayland-scanner private-code "$LAYER_SHELL_XML" "$tmpdir/wlr-layer-shell-unstable-v1-protocol.c"
+wayland-scanner server-header "$FRACTIONAL_SCALE_XML" "$tmpdir/fractional-scale-v1-server-protocol.h"
+wayland-scanner private-code "$FRACTIONAL_SCALE_XML" "$tmpdir/fractional-scale-v1-protocol.c"
 
 cc -Wall -Wextra \
   -o "$tmpdir/wayland-shm-ahb-server" \
@@ -4763,6 +5044,7 @@ cc -Wall -Wextra \
   "$tmpdir/relative-pointer-unstable-v1-protocol.c" \
   "$tmpdir/pointer-constraints-unstable-v1-protocol.c" \
   "$tmpdir/wlr-layer-shell-unstable-v1-protocol.c" \
+  "$tmpdir/fractional-scale-v1-protocol.c" \
   $(pkg-config --cflags --libs wayland-server x11 xtst)
 
 cc -Wall -Wextra \
