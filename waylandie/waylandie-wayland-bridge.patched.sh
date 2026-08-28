@@ -105,6 +105,7 @@ cat >"$tmpdir/wayland-shm-ahb-server.c" <<'EOF'
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <poll.h>
 #include <unistd.h>
@@ -3421,6 +3422,222 @@ static void emit_touch_event(
             (void *)state->focused_surface);
 }
 
+/* ------------------------------------------------------------------ */
+/* Touch gesture layer.                                                */
+/* Hyprland (aquamarine Wayland backend) never binds wl_touch, so all  */
+/* finger input arrives as synthesized pointer events. The raw touch   */
+/* stream is still parsed here, which lets us recognize gestures the   */
+/* pointer stream cannot express: two-finger scroll, long-press right  */
+/* click, and edge swipes -> hyprctl dispatches.                       */
+#define WAYLANDIE_MAX_TOUCHES 10
+struct waylandie_touch_point {
+    int active;
+    int id;
+    double x;
+    double y;
+    double start_x;
+    double start_y;
+    double last_move_x;
+    double last_move_y;
+    long start_ms;
+};
+static struct waylandie_touch_point g_touch_points[WAYLANDIE_MAX_TOUCHES];
+static int g_gesture_multi_touch = 0;
+static int g_gesture_scroll_armed = 0;
+/* Set while any finger is down: the app twins every touch with a
+ * synthesized pointer event, and that twin drags/clicks underneath
+ * whatever the finger is doing. Real pointer events (from an actual
+ * mouse over the app) still pass while no finger is down. */
+static int g_gesture_finger_down = 0;
+static double g_gesture_scroll_last_x = 0.0;
+static double g_gesture_scroll_last_y = 0.0;
+
+static struct waylandie_touch_point *gesture_touch_slot(int id) {
+    for (int i = 0; i < WAYLANDIE_MAX_TOUCHES; i++) {
+        if (g_touch_points[i].active && g_touch_points[i].id == id) {
+            return &g_touch_points[i];
+        }
+    }
+    return NULL;
+}
+
+static struct waylandie_touch_point *gesture_touch_alloc(int id) {
+    struct waylandie_touch_point *free_slot = NULL;
+    for (int i = 0; i < WAYLANDIE_MAX_TOUCHES; i++) {
+        if (g_touch_points[i].active && g_touch_points[i].id == id) {
+            return &g_touch_points[i];
+        }
+        if (!free_slot && !g_touch_points[i].active) {
+            free_slot = &g_touch_points[i];
+        }
+    }
+    return free_slot;
+}
+
+static int gesture_touch_count(void) {
+    int count = 0;
+    for (int i = 0; i < WAYLANDIE_MAX_TOUCHES; i++) {
+        count += g_touch_points[i].active ? 1 : 0;
+    }
+    return count;
+}
+
+static void gesture_hyprctl(const char *dispatch_arg1, const char *dispatch_arg2) {
+    /* Double-fork so the event loop never waits on hyprctl. */
+    pid_t child = fork();
+    if (child < 0) {
+        return;
+    }
+    if (child == 0) {
+        pid_t grand = fork();
+        if (grand == 0) {
+            execlp("hyprctl", "hyprctl", "dispatch", dispatch_arg1, dispatch_arg2, (char *)NULL);
+            _exit(127);
+        }
+        _exit(grand < 0 ? 1 : 0);
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+}
+
+static void gesture_emit_right_click(struct server_state *state, double x, double y) {
+    emit_pointer_motion(state, x, y, (uint32_t)now_msec32());
+    /* RIGHT via button 272 (BTN_RIGHT) as mapped by WAYLANDIE_BTN_LEFT style
+     * constants; emit through the pointer resources with BTN_RIGHT. */
+    struct input_resource_state *pointer;
+    wl_list_for_each(pointer, &state->pointer_resources, link) {
+        if (!resource_same_client(pointer->resource, state->focused_surface)) {
+            continue;
+        }
+        wl_pointer_send_button(
+                pointer->resource,
+                next_input_serial(state),
+                (uint32_t)now_msec32(),
+                0x111 /* BTN_RIGHT */,
+                WL_POINTER_BUTTON_STATE_PRESSED);
+        maybe_send_pointer_frame(pointer->resource);
+        wl_pointer_send_button(
+                pointer->resource,
+                next_input_serial(state),
+                (uint32_t)now_msec32(),
+                0x111 /* BTN_RIGHT */,
+                WL_POINTER_BUTTON_STATE_RELEASED);
+        maybe_send_pointer_frame(pointer->resource);
+    }
+    input_debug_log("gesture long-press right-click x=%.1f y=%.1f", x, y);
+}
+
+static void gesture_handle_touch(
+        struct server_state *state,
+        const char *action,
+        int id,
+        double x,
+        double y) {
+    long now = (long)now_msec32();
+    if (strcmp(action, "down") == 0) {
+        struct waylandie_touch_point *slot = gesture_touch_alloc(id);
+        if (slot == NULL) {
+            return;
+        }
+        slot->active = 1;
+        slot->id = id;
+        slot->x = slot->start_x = slot->last_move_x = x;
+        slot->y = slot->start_y = slot->last_move_y = y;
+        slot->start_ms = now;
+        if (gesture_touch_count() >= 2) {
+            g_gesture_multi_touch = 1;
+            g_gesture_scroll_armed = 0;
+        }
+        return;
+    }
+    if (strcmp(action, "move") == 0) {
+        struct waylandie_touch_point *slot = gesture_touch_slot(id);
+        if (slot == NULL) {
+            return;
+        }
+        slot->x = x;
+        slot->y = y;
+        if (!g_gesture_multi_touch) {
+            return;
+        }
+        double cx = 0.0;
+        double cy = 0.0;
+        int count = 0;
+        for (int i = 0; i < WAYLANDIE_MAX_TOUCHES; i++) {
+            if (g_touch_points[i].active) {
+                cx += g_touch_points[i].x;
+                cy += g_touch_points[i].y;
+                count++;
+            }
+        }
+        if (count < 2) {
+            return;
+        }
+        cx /= count;
+        cy /= count;
+        if (!g_gesture_scroll_armed) {
+            g_gesture_scroll_armed = 1;
+            g_gesture_scroll_last_x = cx;
+            g_gesture_scroll_last_y = cy;
+            return;
+        }
+        double dx = cx - g_gesture_scroll_last_x;
+        double dy = cy - g_gesture_scroll_last_y;
+        if (dx > -6.0 && dx < 6.0 && dy > -6.0 && dy < 6.0) {
+            return;
+        }
+        /* emit_pointer_scroll expects wheel-ish units; ~20px of finger
+         * travel per detent feels natural. */
+        emit_pointer_scroll(state, dx / 20.0, dy / 20.0, (uint32_t)now);
+        input_debug_log("gesture two-finger scroll dx=%.1f dy=%.1f", dx, dy);
+        g_gesture_scroll_last_x = cx;
+        g_gesture_scroll_last_y = cy;
+        return;
+    }
+    if (strcmp(action, "up") == 0 || strcmp(action, "cancel") == 0) {
+        struct waylandie_touch_point *slot = gesture_touch_slot(id);
+        if (slot == NULL) {
+            return;
+        }
+        if (strcmp(action, "cancel") != 0 && !g_gesture_multi_touch) {
+            double dx = x - slot->start_x;
+            double dy = y - slot->start_y;
+            long held = now - slot->start_ms;
+            double adx = dx < 0 ? -dx : dx;
+            double ady = dy < 0 ? -dy : dy;
+            double out_w = state->output_width > 0 ? (double)state->output_width : 1604.0;
+            double out_h = state->output_height > 0 ? (double)state->output_height : 720.0;
+            double edge = 28.0;
+            double swipe_len = 110.0;
+            if (held > 450 && adx < 18.0 && ady < 18.0) {
+                gesture_emit_right_click(state, x, y);
+            } else if (ady < 60.0 && adx > swipe_len) {
+                /* horizontal swipe */
+                if (slot->start_x < edge) {
+                    gesture_hyprctl("workspace", "m-1");
+                    input_debug_log("gesture swipe-left-edge -> workspace m-1");
+                } else if (slot->start_x > out_w - edge) {
+                    gesture_hyprctl("workspace", "m+1");
+                    input_debug_log("gesture swipe-right-edge -> workspace m+1");
+                }
+            } else if (adx < 60.0 && dy < -swipe_len) {
+                /* upward swipe */
+                if (slot->start_y > out_h - edge) {
+                    gesture_hyprctl("togglespecialworkspace", "special");
+                    input_debug_log("gesture swipe-up-bottom -> special workspace");
+                }
+            }
+        }
+        slot->active = 0;
+        if (gesture_touch_count() == 0) {
+            g_gesture_multi_touch = 0;
+            g_gesture_scroll_armed = 0;
+        }
+        return;
+    }
+}
+
 static void handle_input_line(struct server_state *state, const char *line) {
     char kind[32];
     char action[32];
@@ -3449,6 +3666,26 @@ static void handle_input_line(struct server_state *state, const char *line) {
     input_token_int(line, "id", &touch_id);
     input_token_int(line, "keycode", &keycode);
     input_token_int(line, "time", &event_time);
+    int input_source = 0;
+    int input_source_present = input_token_int(line, "source", &input_source);
+    /* The Android app synthesizes a kind=pointer line for every finger
+     * touch alongside the kind=touch line. Forwarding both makes each tap
+     * a double click and makes drags fight the gesture engine. Touchscreen
+     * sources are 0x1002-class (SOURCE_TOUCHSCREEN family); real mice are
+     * 0x2002-class. Drop synthetic touchscreen pointers, keep real ones. */
+    static int drop_touch_pointer_cached = -1;
+    if (drop_touch_pointer_cached < 0) {
+        const char *env = getenv("WAYLANDIE_WAYLAND_DROP_TOUCH_POINTER");
+        drop_touch_pointer_cached = (env != NULL && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    if (drop_touch_pointer_cached
+            && strcmp(kind, "pointer") == 0
+            && input_source_present
+            && (input_source & 0x00001000) != 0
+            && (input_source & 0x00002000) == 0) {
+        input_debug_log("pointer drop=touch-source source=0x%x action=%s", input_source, action);
+        return;
+    }
     map_input_to_focused_surface(state, input_width, input_height, &x, &y);
     input_debug_log(
             "input-line kind=%s action=%s x=%.1f y=%.1f width=%.1f height=%.1f focused=%p",
@@ -3461,6 +3698,14 @@ static void handle_input_line(struct server_state *state, const char *line) {
             (void *)state->focused_surface);
 
     if (strcmp(kind, "pointer") == 0) {
+        if (g_gesture_multi_touch || g_gesture_finger_down) {
+            /* Finger input during a gesture or drag: the gesture layer
+             * already synthesized scroll; the app's pointer twin would
+             * drag-select underneath it. A plain drag (finger down, no
+             * second finger) also mutes the twin so drags don't click. */
+            input_debug_log("pointer drop=touch-in-progress action=%s", action);
+            return;
+        }
         if (strcmp(action, "move") == 0) {
             emit_pointer_motion(state, x, y, (uint32_t)event_time);
             xtest_pointer_move(state, x, y);
@@ -3476,6 +3721,7 @@ static void handle_input_line(struct server_state *state, const char *line) {
             emit_pointer_scroll(state, hscroll, vscroll, (uint32_t)event_time);
         }
     } else if (strcmp(kind, "touch") == 0) {
+        gesture_handle_touch(state, action, touch_id, x, y);
         emit_touch_event(state, action, touch_id, x, y, (uint32_t)event_time);
     } else if (strcmp(kind, "text") == 0) {
         if (strcmp(action, "commit") == 0

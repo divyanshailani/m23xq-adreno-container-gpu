@@ -564,3 +564,30 @@ bridge+app are fast; Hyprland's composite is the cost.
 ### Present-rate probe
 `rate frames=N elapsed-ms=X fps=Y avg-present-ms=Z` every 60 frames in
 server.log — the key diagnostic for all future tuning.
+
+## 2026-08-28 — EXP-015: Mac VNC experiment + freeze #5 (app bridge flags)
+
+### VNC-to-Mac experiment (built, measured, removed per user decision)
+- wayvnc 0.10.1 in container; Hyprland headless output
+  (`hyprctl output create headless` + `mode 1920x1080@60`) gives the Mac
+  its own native-res desktop: architecture worked end to end.
+- macOS Screen Sharing is a dead end: negotiates RFB 3.3, refuses None
+  auth, chokes on neatvnc RSA-AES (type 30/33/35/36), and connecting to
+  127.0.0.1 hits the MAC'S OWN Screen Sharing server (binds 5900
+  system-side, banner RFB 003.889) — that produced the "you cannot
+  control your screen" popup.
+- TigerVNC client connected fine over Wi-Fi; with --gpu (ext-image-copy
+  capture via /dev/dri/renderD128) capture hit 40-55fps; WITHOUT it
+  screencopy shm readback caps ~10fps.
+- Wayvnc input injection never worked through the headless seat (only the
+  bridge's wl_keyboard/wl_pointer existed); user dropped the Mac path —
+  uninstalled wayvnc, removed headless output, uninstalled TigerVNC.
+
+### Freeze #5 — plain am start without bridge flags
+Post-teardown relaunch used plain `am start` (no --ez waylandie_bridge_server
+/ waylandie_external_present_only) plus rapid stack restart → phone-wide
+UI wedge, 4th samloader Download Mode escape (BOOT 851a9710... verified).
+Recovery + correct relaunch sequence documented in memory
+(waylandie-app-bridge-flags-mandatory). Lesson: the app flags are not
+optional and the stack relaunch must be staged: app (flagged) → settle →
+bridge → verify zero status=fail → Hyprland.
