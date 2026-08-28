@@ -528,3 +528,39 @@ fresh session, vision confirms: icons render as proper glyphs, bar complete,
 panels sane. Note: quickshell restart scripts must auto-detect Hyprland's
 socket (ls runtime-0 | grep wayland-N | sort -rn | head -1) — hardcoded
 wayland-1 breaks after reboots.
+
+## 2026-08-28 — EXP-014: The 48fps mystery solved — GPU composite + async present chain — **91fps at half res**
+
+### The measurement chain (each step instrumented)
+- Pipelining (callbacks+release before present): present 24ms→8ms.
+- Flush-before-present (wl_display_flush_clients before the blocking present):
+  confirmed release reaches client immediately.
+- ASYNC PRESENT (the big one): send dmabuf to app, drain the PREVIOUS
+  response non-blocking, return instantly. Present-ms: 8→2.9→1.2ms.
+  Fragmented socket reads must be handled (drain till newline, partial =
+  defer, never fail). avg-present-ms now ~1.0-1.5ms.
+- Eager frame-done (reply wl_callback.done on request in immediate mode):
+  kept — harmless and removes commit-gating.
+- 1ms event loop timeout: kept.
+
+### The real ceiling
+Despite all of the above: 48fps at 2408x1080. GPU busy 99% @800MHz during
+animation — the freedreno composite of the full end-4 desktop (wallpaper +
+bar + layers + blur) is the limiter. Aquamarine also enforces one frame
+in flight (mirrors DRM's flip invariant), so render time directly divides
+fps. Notably: vkcube DIRECT to bridge (bypassing Hyprland) = 180-192fps —
+bridge+app are fast; Hyprland's composite is the cost.
+- 1604x720 (CLIENT_WIDTH/HEIGHT on bridge; aquamarine follows host mode):
+  **91fps**. GPU scaling confirmed as the cap.
+
+### Bugs fixed this round
+- DUPLICATE BAR: two quickshell instances (one spawned by execs as "qs",
+  one by restart script as "/usr/bin/qs" — pgrep pattern "^/usr/bin/qs"
+  missed the plain "qs" one). Killed via container namespace. Fix pattern:
+  always kill BOTH cmdline forms.
+- hyprctl keyword doesn't work with Lua config (need hyprctl eval or
+  config edit + reload).
+
+### Present-rate probe
+`rate frames=N elapsed-ms=X fps=Y avg-present-ms=Z` every 60 frames in
+server.log — the key diagnostic for all future tuning.

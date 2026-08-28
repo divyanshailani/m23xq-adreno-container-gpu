@@ -106,6 +106,7 @@ cat >"$tmpdir/wayland-shm-ahb-server.c" <<'EOF'
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
+#include <poll.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
@@ -158,6 +159,9 @@ struct server_state {
     int android_windows;
     int next_window_id;
     double total_present_ms;
+    int present_rate_samples;
+    double present_rate_t0_ms;
+    int present_rate_t0_count;
     double total_app_wait_us;
     double total_app_slot_wait_us;
     int app_wait_samples;
@@ -913,6 +917,29 @@ static int present_buffer_to_android(struct surface_state *surface, struct shm_b
         printf("wayland-shm-ahb frame=%d status=fail reason=bridge-connect errno=%d\n", frame_index, errno);
         return -1;
     }
+    /* ASYNC PRESENT: send this frame's command, then drain the PREVIOUS
+     * frame's response non-blocking. The app processes the new dmabuf while
+     * the client renders its next frame. The old synchronous read() here
+     * blocked the commit handler ~8ms — the last serializer in the loop.
+     * Responses are only used for pass/fail accounting; a hard app failure
+     * still surfaces as a send/read error on a following frame. A partial
+     * (fragmented) response line is treated as "not ready yet" and drains
+     * on a later frame — never a failure. */
+    ssize_t response_len = 0;
+    int response_complete = 0;
+    struct pollfd pfd = { .fd = state->bridge_sock, .events = POLLIN };
+    while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+        ssize_t chunk = read(state->bridge_sock, response + response_len, sizeof(response) - 1U - (size_t)response_len);
+        if (chunk <= 0) {
+            break;
+        }
+        response_len += chunk;
+        response[response_len] = '\0';
+        if (strchr(response, '\n') != NULL || (size_t)response_len >= sizeof(response) - 1U) {
+            response_complete = 1;
+            break;
+        }
+    }
     if (send_command_with_fd(state->bridge_sock, command, buffer->dmabuf_fd) != 0) {
         printf("wayland-shm-ahb frame=%d status=fail reason=dmabuf-send errno=%d\n", frame_index, errno);
         close(state->bridge_sock);
@@ -920,17 +947,22 @@ static int present_buffer_to_android(struct surface_state *surface, struct shm_b
         state->bridge_frames_on_socket = 0;
         goto cleanup;
     }
-    ssize_t response_len = read(state->bridge_sock, response, sizeof(response) - 1U);
-    if (response_len <= 0) {
-        printf("wayland-shm-ahb frame=%d status=fail reason=response errno=%d\n", frame_index, errno);
-        close(state->bridge_sock);
-        state->bridge_sock = -1;
-        state->bridge_frames_on_socket = 0;
+    if (response_len == 0) {
+        /* No previous response ready yet — fine, it drains next frame. */
+        state->bridge_frames_on_socket++;
+        status = 0;
         goto cleanup;
     }
-    response[response_len] = '\0';
-    if (strstr(response, RESPONSE_PREFIX) == NULL || !response_is_pass(response, (size_t)response_len)) {
-        printf("wayland-shm-ahb frame=%d status=fail reason=app-response response=%s\n", frame_index, response);
+    if (!response_complete
+            || strstr(response, RESPONSE_PREFIX) == NULL
+            || !response_is_pass(response, (size_t)response_len)) {
+        if (response_complete && strstr(response, RESPONSE_PREFIX) != NULL) {
+            printf("wayland-shm-ahb frame=%d status=fail reason=app-response response=%s\n", frame_index, response);
+            goto cleanup;
+        }
+        /* fragmented / not-yet-complete response: defer to next frame */
+        state->bridge_frames_on_socket++;
+        status = 0;
         goto cleanup;
     }
     double present_ms = now_ms() - start_ms;
@@ -948,19 +980,35 @@ static int present_buffer_to_android(struct surface_state *surface, struct shm_b
     }
     if (state->pass_log_interval > 0 && (frame_index % state->pass_log_interval) == 0) {
         printf(
-            "wayland-shm-ahb frame=%d status=pass kind=dmabuf client=%dx%d format=0x%08x modifier=0x%016" PRIx64 " stride=%d size=%" PRIu64 " zero-copy=gpu driver=%s present-ms=%.3f app-wait-us=%lld app-slot-wait-us=%lld source-wait-us=%lld\n",
-            frame_index,
-            buffer->width,
-            buffer->height,
-            buffer->format,
-            buffer->modifier,
-            buffer->stride,
-            dmabuf_size,
-            driver_name,
-            present_ms,
-            app_wait_us,
-            app_slot_wait_us,
-            source_wait_us);
+                "wayland-shm-ahb frame=%d status=pass kind=dmabuf client=%dx%d format=0x%08x modifier=0x%016" PRIx64 " stride=%d size=%" PRIu64 " zero-copy=gpu driver=%s present-ms=%.3f app-wait-us=%lld app-slot-wait-us=%lld source-wait-us=%lld\n",
+                frame_index,
+                buffer->width,
+                buffer->height,
+                buffer->format,
+                buffer->modifier,
+                buffer->stride,
+                dmabuf_size,
+                driver_name,
+                present_ms,
+                app_wait_us,
+                app_slot_wait_us,
+                source_wait_us);
+    }
+    /* Live timing heartbeat: every 60 frames print recent present-rate stats
+     * so the fps ceiling can be diagnosed without waiting for exit summary. */
+    state->present_rate_samples++;
+    if ((state->present_rate_samples % 60) == 1) {
+        state->present_rate_t0_ms = now_ms();
+        state->present_rate_t0_count = state->commit_count;
+    } else if ((state->present_rate_samples % 60) == 0) {
+        double rate_dt = now_ms() - state->present_rate_t0_ms;
+        int rate_frames = state->commit_count - state->present_rate_t0_count;
+        if (rate_dt > 0.0 && rate_frames > 0) {
+            printf("wayland-shm-ahb rate frames=%d elapsed-ms=%.1f fps=%.1f avg-present-ms=%.2f\n",
+                    rate_frames, rate_dt, rate_frames * 1000.0 / rate_dt,
+                    state->total_present_ms / (double)(state->commit_count > 0 ? state->commit_count : 1));
+            fflush(stdout);
+        }
     }
     state->bridge_frames_on_socket++;
     status = 0;
@@ -3775,6 +3823,19 @@ static void surface_frame(struct wl_client *client, struct wl_resource *resource
     callback_state->resource = cb;
     wl_list_insert(surface->frame_callbacks.prev, &callback_state->link);
     wl_resource_set_implementation(cb, NULL, callback_state, destroy_frame_callback_resource);
+
+    /* EAGER FRAME DONE: reply immediately on request rather than waiting for
+     * the next commit. Compositors like Hyprland gate their entire render loop
+     * on callback.done; tying it to commits serializes
+     * done->render->commit->present into one round-trip (~21ms = 48fps cap).
+     * Replying eagerly lets the client render its next frame while we present
+     * the current one. Pace at the configured interval to avoid unthrottled
+     * spin (paced mode uses sleep; immediate mode replies at once). */
+    struct server_state *server = surface->server;
+    if (server != NULL
+            && server->frame_interval_ms <= 0.0) {
+        send_surface_frame_callbacks(surface);
+    }
 }
 
 static void surface_set_opaque_region(struct wl_client *client, struct wl_resource *resource, struct wl_resource *region) {
@@ -3919,6 +3980,29 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
         send_surface_frame_callbacks(surface);
         return;
     }
+    /* PIPELINING: send frame callbacks + buffer release BEFORE the ~24ms
+     * synchronous present. The client (Hyprland) then renders its next frame
+     * while Android presents the current one — without this, the serial
+     * callback→render→commit→present round-trip caps fps at ~1/(24ms+render). */
+    send_focus_for_presentable(surface, presentable, buffer_to_present);
+    if (presentable != surface) {
+        send_surface_frame_callbacks(presentable);
+        send_surface_presentation_feedback(surface, 0);
+    }
+    send_surface_frame_callbacks(surface);
+    if (presentable != surface && surface->pending_buffer != NULL && surface->pending_buffer->resource != NULL) {
+        wl_buffer_send_release(surface->pending_buffer->resource);
+    }
+    if (buffer_to_present != NULL && buffer_to_present->resource != NULL) {
+        wl_buffer_send_release(buffer_to_present->resource);
+    }
+    /* FLUSH NOW: the callbacks + release above sit in the server's outgoing
+     * socket buffer. Without an explicit flush they only reach the client
+     * after wl_event_loop_dispatch returns — i.e. after the ~8ms present
+     * below — which serializes the client's next render behind our present.
+     * Flushing here lets Hyprland start rendering the next frame while we
+     * present this one. */
+    wl_display_flush_clients(surface->server->display);
     if (ensure_android_window_for_surface(surface, buffer_to_present) != 0
             || present_buffer_to_android(surface, buffer_to_present, frame_index) != 0) {
         surface->server->present_failures++;
@@ -3927,12 +4011,6 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
         present_failed = 1;
         fflush(stdout);
         wl_display_terminate(surface->server->display);
-    }
-    if (presentable != surface && surface->pending_buffer != NULL && surface->pending_buffer->resource != NULL) {
-        wl_buffer_send_release(surface->pending_buffer->resource);
-    }
-    if (buffer_to_present != NULL && buffer_to_present->resource != NULL) {
-        wl_buffer_send_release(buffer_to_present->resource);
     }
     surface->has_pending_attach = 0;
     surface->pending_buffer = NULL;
@@ -3945,15 +4023,12 @@ static void surface_commit(struct wl_client *client, struct wl_resource *resourc
     if (presentable != surface) {
         presentable->commit_count++;
     }
-    send_focus_for_presentable(surface, presentable, buffer_to_present);
     if (!present_failed) {
         send_surface_presentation_feedback(presentable, 1);
     }
     if (presentable != surface) {
-        send_surface_frame_callbacks(presentable);
         send_surface_presentation_feedback(surface, present_failed ? 0 : 1);
     }
-    send_surface_frame_callbacks(surface);
 }
 
 static void surface_set_buffer_transform(struct wl_client *client, struct wl_resource *resource, int32_t transform) {
@@ -4201,7 +4276,7 @@ int main(int argc, char **argv) {
     while (!state.abort_requested
             && state.commit_count < state.target_commits
             && (now_ms() - start_ms) < timeout_ms) {
-        wl_event_loop_dispatch(loop, 20);
+        wl_event_loop_dispatch(loop, 1);
         ping_bound_xdg_wm_bases(&state);
         wl_display_flush_clients(state.display);
         if (state.accept_client_complete
@@ -4269,6 +4344,7 @@ cat >"$tmpdir/wayland-shm-ahb-client.c" <<'EOF'
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <poll.h>
 #include <unistd.h>
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
