@@ -515,3 +515,16 @@ CLIENT_MODE=external ACCEPT_CLIENT_COMPLETE=0`.
 - KDE Qt theming step of switchwall errors harmlessly (no kde-material-you-colors).
 - Smoothness of end-4's own animations under interaction still needs user-visual
   assessment; the render path sustains 46 fps.
+
+### EXP-013 addendum: the "broken UI" was one missing font
+Vision-model analysis (qwen vision_chat on live screenshots) identified the
+mess: every icon rendered as raw text names ("bookmark_heart", "wifi_find")
+spilling out of containers. Root cause: **Material Symbols Rounded font was
+never installed** (end-4's entire icon set; dep `ttf-material-symbols-variable-git`
+was in the never-run installer path). Fix: downloaded the variable TTF from
+google/material-design-icons, installed to
+/usr/share/fonts/TIFF/material-symbols/, fc-cache. After quickshell restart +
+fresh session, vision confirms: icons render as proper glyphs, bar complete,
+panels sane. Note: quickshell restart scripts must auto-detect Hyprland's
+socket (ls runtime-0 | grep wayland-N | sort -rn | head -1) — hardcoded
+wayland-1 breaks after reboots.
