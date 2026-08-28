@@ -549,6 +549,9 @@ static void xtest_type_text_hex(struct server_state *state, const char *hex) {
 }
 
 static void wl_keyboard_handle_android_key(struct server_state *state, int keycode, const char *action);
+static void wl_keyboard_emit_key(struct server_state *state, int evdev_code, int down);
+static void wl_keyboard_emit_modifier(struct server_state *state, int evdev_code, int down);
+static void wl_keyboard_type_text(struct server_state *state, const char *hex);
 static uint32_t next_input_serial(struct server_state *state);
 static int resource_same_client(struct wl_resource *a, struct wl_resource *b);
 static uint32_t now_msec32(void);
@@ -743,6 +746,92 @@ static void wl_keyboard_emit_modifier(struct server_state *state, int evdev_code
                 0 /* group */);
     }
     input_debug_log("wl-modifiers depressed=0x%x (code=%d down=%d)", g_wl_mod_depressed, evdev_code, down);
+}
+
+/* Type text into the focused WAYLAND client (Hyprland + native windows
+ * like kitty). Maps printable ASCII to evdev keycodes with shift state. */
+static int wl_keycode_for_char(char c, int *needs_shift) {
+    *needs_shift = 0;
+    if (c >= 'a' && c <= 'z') return 16 + (c - 'a');            /* KEY_A..KEY_Z */
+    if (c >= 'A' && c <= 'Z') { *needs_shift = 1; return 16 + (c - 'A'); }
+    if (c >= '1' && c <= '9') return 2 + (c - '1');              /* KEY_1..KEY_9 */
+    if (c == '0') return 11;
+    switch (c) {
+        case ' ': return 57;
+        case '\n': return 28;
+        case '\t': return 15;
+        case '.': return 52;
+        case ',': return 51;
+        case '-': return 12;
+        case '=': return 13;
+        case '/': return 53;
+        case ';': return 39;
+        case '\'': return 40;
+        case '[': return 26;
+        case ']': return 27;
+        case '\\': return 43;
+        case '`': return 41;
+        case '!': case '@': case '#': case '$': case '%': case '^':
+        case '&': case '*': case '(': case ')':
+            *needs_shift = 1;
+            return c == '!' ? 2 : c == '@' ? 3 : c == '#' ? 4 : c == '$' ? 5 :
+                   c == '%' ? 6 : c == '^' ? 7 : c == '&' ? 8 : c == '*' ? 9 :
+                   c == '(' ? 10 : 11;
+        case '"': *needs_shift = 1; return 40;
+        case ':': *needs_shift = 1; return 39;
+        case '<': *needs_shift = 1; return 51;
+        case '>': *needs_shift = 1; return 52;
+        case '?': *needs_shift = 1; return 53;
+        case '_': *needs_shift = 1; return 12;
+        case '+': *needs_shift = 1; return 13;
+        case '{': *needs_shift = 1; return 26;
+        case '}': *needs_shift = 1; return 27;
+        case '|': *needs_shift = 1; return 43;
+        case '~': *needs_shift = 1; return 41;
+        default: return -1;
+    }
+}
+
+static void wl_keyboard_type_text(struct server_state *state, const char *hex) {
+    if (hex == NULL) {
+        return;
+    }
+    int count = 0;
+    int shift_down = 0;
+    for (size_t i = 0; hex[i] != '\0' && hex[i + 1] != '\0'; i += 2) {
+        int high = hex_value(hex[i]);
+        int low = hex_value(hex[i + 1]);
+        if (high < 0 || low < 0) {
+            break;
+        }
+        unsigned char byte = (unsigned char)((high << 4) | low);
+        if (byte >= 0x80U) {
+            continue; /* non-ASCII dropped (IME CJK needs a proper protocol) */
+        }
+        char c = (char)byte;
+        int needs_shift = 0;
+        int code = wl_keycode_for_char(c, &needs_shift);
+        if (code < 0) {
+            continue;
+        }
+        if (needs_shift && !shift_down) {
+            wl_keyboard_emit_modifier(state, 42, 1);
+            wl_keyboard_emit_key(state, 42, 1);
+            shift_down = 1;
+        } else if (!needs_shift && shift_down) {
+            wl_keyboard_emit_key(state, 42, 0);
+            wl_keyboard_emit_modifier(state, 42, 0);
+            shift_down = 0;
+        }
+        wl_keyboard_emit_key(state, code, 1);
+        wl_keyboard_emit_key(state, code, 0);
+        count++;
+    }
+    if (shift_down) {
+        wl_keyboard_emit_key(state, 42, 0);
+        wl_keyboard_emit_modifier(state, 42, 0);
+    }
+    input_debug_log("wl-type chars=%d", count);
 }
 
 static void wl_keyboard_handle_android_key(struct server_state *state, int keycode, const char *action) {
@@ -4000,6 +4089,7 @@ static void handle_input_line(struct server_state *state, const char *line) {
     } else if (strcmp(kind, "text") == 0) {
         if (strcmp(action, "commit") == 0
                 && input_token_string(line, "text_hex", text_hex, sizeof(text_hex))) {
+            wl_keyboard_type_text(state, text_hex);
             xtest_type_text_hex(state, text_hex);
         }
     } else if (strcmp(kind, "key") == 0) {

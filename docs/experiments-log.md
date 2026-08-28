@@ -623,3 +623,61 @@ bridge → verify zero status=fail → Hyprland.
   App APK patched to consume key events in dispatchKeyEvent when bridge owns the
   session (so Android's Meta/home shortcut is bypassed) — Super key still escapes
   in practice, needs live keyboard debugging.
+
+## 2026-08-28 — EXP-017: WayLandIE Hyprland desktop — **FAILED / CLOSED**
+
+### Verdict
+The GPU-accelerated Hyprland desktop on the phone is **not daily-drivable** and the
+experiment is closed. Ten system freezes in one day (10x battery disconnect +
+Download Mode + samloader BOOT escape), with the freeze mechanism never captured
+and never fixed, makes the stack unusable regardless of how good individual
+subsystems got.
+
+### What was achieved (real, verified)
+- GPU compositing worked: freedreno FD619 GL / Turnip Vulkan through lfdevs Mesa
+  26.3.0 on /dev/kgsl-3d0, vkcube-through-Hyprland at 128-132 fps at 1203x540.
+- Correct UI scaling solved (1203x540 = integer 2x of native, sharp).
+- wvkbd layer-shell OSK docked with working exclusive zone
+  (hyprctl reserved: 0 40 0 120), Super/Ctrl/Alt/Esc/Tab/arrows present.
+- Hardware keyboard into Hyprland via bridge keycode->evdev mapping.
+- Final app work (2026-08-28): sensorLandscape (fixes fullSensor portrait
+  fallback), adjustNothing + IME-inset forwarding, a11y KeyInterceptor for
+  META capture, on-screen sticky modifier bar. Built, installed, verified
+  boot-safe — but never validated live because the freeze pattern made
+  on-device iteration impossible.
+
+### Why it failed
+- **10 Android system freezes** (system_server wedge, adb hangs, USB drops to
+  PMIC battery-latch state several times). None of the mitigations held:
+  memory cap + cpu.shares + spin watchdog (freeze #3), plain config vs end-4,
+  1203x540 low resolution, guarded launch sequence.
+- Prime suspect per freeze #3 analysis: KGSL contention — container freedreno
+  and the app-side Turnip both driving /dev/kgsl-3d0 under sustained 60fps
+  compositing. A KGSL hang freezes SurfaceFlinger system-wide; no CPU watchdog
+  can catch it. Never confirmed: the framework dies before logging, and the
+  tombstones present are unrelated (webview zygote trace_marker aborts).
+- The input/UX layer never reached parity either: Super stolen by
+  PhoneWindowManager pre-dispatch, IME overlay, aquamarine Wayland backend has
+  no wl_touch (touch = pointer emulation only). Fixes were built but the
+  freeze instability made validation impossible.
+
+### Cleanup done (2026-08-28)
+- io.waylandie.display uninstalled; rotation restored to auto.
+- Container /root purged: all ii-*/wl-*/hypr-*/dri*/stage* scripts, logs,
+  test binaries, shims, waylandie/, wvkbd/, dots-hyprland/, aquamarine/,
+  weston-src/, rice configs (illogical-impulse, matugen, fuzzel, foot, wlogout,
+  cava, darklyrc, weston.ini), .config-backup-ii, screenshots, wallpapers.
+- Source tree and artifacts preserved on /Volumes/ssd/phone-recovery/
+  (waylandie bridge script, app source with the final patches, logs).
+- Kernel/root/Droidspaces base untouched and healthy — only the desktop
+  experiment is closed.
+
+### What a future attempt needs (if ever reopened)
+1. Root-cause the KGSL freeze first: serial console or pstore/ramoops capture,
+   KGSL ioctl tracing, single-GPU-client testing (container-only, no app-side
+   Turnip) to bisect the contention hypothesis. Do not relaunch compositing
+   before this is pinned.
+2. Consider a compositor that does not require the Android-side Vulkan
+   presenter (eliminates the dual-KGSL-client hypothesis entirely).
+3. aquamarine wl_touch patch (~150 lines) for real touch; a11y KeyInterceptor
+   for META — both designed this session, specs in the research notes.
