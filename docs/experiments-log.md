@@ -322,3 +322,65 @@ Full display pipeline: Droidspaces container → Termux:X11 → phone screen.
   periodic ping patch).
 - Known cosmetic: hyprland.conf `debug:verbose` option removed in 0.56 (warning
   banner on screen until config reload).
+
+## 2026-08-28 — EXP-010: end-4 rice attempt, two device freezes, and the llvmpipe misclassification — **ROOT-CAUSED (no relaunch yet)**
+
+### The incidents
+Two full Android UI freezes (UI unresponsive, adb shell hung, device off USB)
+during end-4/dots-hyprland bring-up, both recovered by the owner's battery
+disconnect + samloader `flash -p BOOT` (byte-identical custom BOOT, auto-reboot
+out of Download Mode — the proven escape hatch, ~50 s to ADB).
+
+### Forensics (read-only, from /data/system/dropbox + container logs)
+- `system_server_pre_watchdog@01:38` (freeze 1): **Hyprland at 94% CPU (40%
+  user + 54% kernel)**, loadavg 59, `/proc/pressure/memory some=80%`,
+  `/proc/pressure/io some=91%`, kswapd active, system_server at 83% with 49740
+  minor faults — a classic memory-thrash livelock, not a kernel panic (KMSG
+  clean, bootloader-only).
+- Freeze 2's Hyprland crashed at `CBackend::create() failed!` (04:45, empty GPU
+  field in crash report) — but the same launch script's earlier run is what
+  spun.
+- **The misclassification (self-caught, corrects EXP-009)**: the freeze-1-era
+  `hyprland.log` contains `MESA: error: ZINK: failed to choose pdev` and an
+  empty `GPU information:` field. The "GPU-composited, idles at 0%" claim in
+  EXP-009 was wrong — **that Hyprland was llvmpipe software rendering all
+  along**. vkcube (pure Vulkan) was the only true GPU render in the chain.
+
+### Root cause
+1. `zink_get_display_device()` matches the chosen Vulkan pdev against the
+   Wayland `linux-dmabuf` `main_device` (bridge correctly advertises
+   `/dev/kgsl-3d0`, char 511:0). Turnip-on-KGSL reports no DRM render node
+   (`hasRender=0`), so the match fails → `ZINK: failed to choose pdev` →
+   Mesa silently falls back to llvmpipe.
+2. llvmpipe renders the desktop at 1080×2408 on CPU; with end-4's Lua config
+   (3-pass blur + xray + shadows + dim), CPU pegs at 94% and buffer memory
+   balloons until Android's system_server thrashes → watchdog → UI dead.
+   The plain-config run merely *survived* on llvmpipe; the rice exposed it.
+3. Contributing: the ii launch scripts (`ii-launch.sh`/`ii-safe.sh`) exported
+   no Mesa env at all (no `GALLIUM_DRIVER`, no override), guaranteeing the
+   fallback path.
+
+### The fix (researched, verified against container contents, NOT yet launched)
+- lfdevs/mesa-for-android-container README: for Adreno 6xx use
+  `MESA_LOADER_DRIVER_OVERRIDE=kgsl` — freedreno GL **directly over KGSL**,
+  no zink in the path (`kgsl_dri.so` is present in the container). Zink is
+  only needed for a8xx parts.
+- Alternative (zink path): zorrobyte/razr-fold-2026-lindroid
+  `zink-kgsl-pdev-fallback.patch` — one-line zink pdev fallback; documented
+  as the fix for this exact `failed to choose pdev` on turnip/KGSL.
+- Verified in container: `/dev/kgsl-3d0` and `/dev/ion` present (turnip
+  supports both ION and dma_heap; this 4.19 host exposes ION only — fine),
+  turnip ICD installed, bridge ping patch intact.
+
+### Safe relaunch plan (requires owner approval before any launch)
+1. Stage env: `MESA_LOADER_DRIVER_OVERRIDE=kgsl` (+ lfdevs vblank hint
+   `vblank_mode=3 MESA_VK_WSI_PRESENT_MODE=mailbox` if tearing).
+2. **Hard caps before launch**: cgroup cpu.max + memory.max on the container
+   so a software-rendering fallback can physically not wedge Android again.
+3. **llvmpipe watchdog**: pre-launch GL probe must report a non-llvmpipe
+   `GL_RENDERER` (expected: `freedreno` over kgsl), else abort launch.
+4. Re-verify with plain config first, then end-4 execs, then full rice —
+   one variable per launch, caps always on.
+
+- execs.lua already restored (a later ii-files.sh re-copy put the original
+  25-line file back; verified).
