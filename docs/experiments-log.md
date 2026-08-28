@@ -437,3 +437,42 @@ out of Download Mode — the proven escape hatch, ~50 s to ADB).
   or the existing gles2-test binary), timeboxed, with recorder — cleanly separates
   "freedreno via bridge" from "Hyprland" from "Hyprland+freedreno".
 - Only then: Hyprland plain-config relaunch, user present.
+
+## 2026-08-28 — EXP-012: The freeze root cause — bridge focus ping-pong — **FIXED: Hyprland idles at 0% CPU, GPU-composited**
+
+### The full freeze mechanism (explains all three freezes)
+The bridge re-sent keyboard enter + XKB keymap + pointer enter on the focus
+path of EVERY commit. With two clients alternating commits — Hyprland
+(aquamarine) and its XWayland child — focus ping-ponged between them each
+frame. Aquamarine treats each enter as a focus change (log line
+"[wayland] focus changed: WAYLAND-1" × thousands), doing real work per
+event at 60 Hz → ~95% CPU spin → (before the watchdog existed) phone-wide
+UI freeze. Freeze 1 differed only in additionally being llvmpipe
+(zink pdev fail, EXP-010).
+
+### Why it took so long to find
+The bridge is a TEST HARNESS by default: FRAME_COUNT=12 (server exits after
+12 commits!), SERVER_TIMEOUT_MS=15000, plus a self-test client
+(CLIENT_MODE=internal). Every "server died" we saw was the harness exiting
+normally — masking the focus bug behind what looked like a flaky bridge.
+Persistent server config: `FRAME_COUNT=100000000 SERVER_TIMEOUT_MS=100000000
+CLIENT_MODE=external ACCEPT_CLIENT_COMPLETE=0`.
+
+### The fixes (all in waylandie-wayland-bridge.patched.sh)
+1. **Sticky focus** (THE fix): `send_surface_focus` now returns early if ANY
+   surface is focused; only surface destroy clears it. Kills the ping-pong.
+2. Persistent-server env config (above).
+3. XKB_V1 keymap via memfd (replaces NO_KEYMAP stub; eglut clients assert).
+4. (Earlier) wl_compositor v6 + periodic xdg ping (EXP-009).
+
+### Verification chain
+- Isolation: 570k frames/120s gles2 loop on FD619 — GPU path exonerated.
+- Paced client: reproduced starvation deterministically (13 callbacks) →
+  led to discovering the harness exit.
+- Persistent config: 2,440 frames/60s paced (~40 fps), server survives
+  client disconnect.
+- Hyprland + sticky focus: **0 "focus changed" lines, 0 CPU ticks/10s at
+  idle, 7680x4320 BGTex scaled to 2688x1216** — GPU-composited desktop.
+- Spin watchdog v2 (90s grace, >85%/20s kill) + memcg 2.5GB cap + cpu.shares
+  512 + dmesg/KGSL flight recorder all active during testing; watchdog
+  saved the phone from two spins (2067 and 1906 ticks) before the fix.

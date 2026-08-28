@@ -2479,7 +2479,11 @@ static void send_surface_focus(
     if (state->pointer_y > (double)(state->focused_surface_height - 1)) {
         state->pointer_y = (double)(state->focused_surface_height - 1);
     }
-    if (state->focused_surface == surface_resource) {
+    if (state->focused_surface != NULL) {
+        /* Sticky focus: only destroy resets it. Without this, two clients
+         * alternating commits (Hyprland + XWayland) ping-pong focus and emit
+         * keyboard.enter + keymap + pointer.enter on EVERY frame, which
+         * aquamarine logs/handles as a focus change — a full-CPU spin. */
         return;
     }
     state->focused_surface = surface_resource;
