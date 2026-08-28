@@ -476,3 +476,42 @@ CLIENT_MODE=external ACCEPT_CLIENT_COMPLETE=0`.
 - Spin watchdog v2 (90s grace, >85%/20s kill) + memcg 2.5GB cap + cpu.shares
   512 + dmesg/KGSL flight recorder all active during testing; watchdog
   saved the phone from two spins (2067 and 1906 ticks) before the fix.
+
+## 2026-08-28 — EXP-013: end-4 rice fully live on the phone — **SUCCESS (visual polish ongoing)**
+
+### The completed stack
+- **zwlr_layer_shell_v1 implemented in the bridge** (minimal): layer surfaces map onto
+  the xdg present path (is_xdg_surface=1 + configure/ack). quickshell's bar,
+  background, and overlay layers all present. Handlers: set_size (re-configures
+  pre-first-commit), anchor/margin/exclusive_zone ignored, set_layer no-op,
+  get_popup stub, ack_configure marks configured. Protocol XML at
+  /root/wlr-layer-shell-unstable-v1.xml, LAYER_SHELL_XML env.
+- **end-4 dependencies**: shapes submodule (end-4/rounded-polygon-qmljs — was an
+  uninitialized git submodule causing quickshell's fatal "shapes not installed"),
+  matugen 4.2.0 built from source (rust in container, 8.5 min; no aarch64 prebuilt).
+- **Theme pipeline live**: wallpaper at /root/Pictures/Wallpapers/forest.jpg →
+  config.json background.wallpaperPath → switchwall.sh → matugen → colors.json +
+  material_colors.scss → quickshell Material-You colors. Wallpaper + derived
+  greens confirmed rendering on screen.
+- **Launch recipe (ii-rice7.sh)**: app started first, then bridge persistent mode
+  (FRAME_COUNT=1e8, SERVER_TIMEOUT=1e8, CLIENT_MODE=external,
+  EXTERNAL_CLIENT_COMMAND=Hyprland itself) + CLIENT_WIDTH=2408 CLIENT_HEIGHT=1080
+  (native — fixes Android-side scaling blur) + paced callbacks at 120Hz interval
+  (FRAME_INTERVAL_MS=8.333, WAYLANDIE_WAYLAND_REFRESH_HZ=120) + monitor override
+  2408x1080 in custom/general.lua.
+
+### Performance (verified numbers)
+- Animated client (vkcube as Hyprland window, freedreno→bridge→Turnip→SF):
+  **sustained 46 fps**, steady across windows.
+- Idle: 0.7 fps presents, Hyprland 7 CPU ticks/10s — healthy.
+- Watchdog v3 (grace 90s, kill >850 ticks/20s = 85%): correct threshold after v2's
+  false kill (286 ticks was normal rice animation activity). Old v2 was running
+  alongside v3 — must kill by cmdline match when redeploying.
+
+### Remaining known gaps
+- hyprctl reports monitor @60 (aquamarine measures callback cadence at startup;
+  cosmetic — actual pacing is 8.33ms).
+- eglSwapBuffers 0x300d warnings in early quickshell runs were pre-layer-shell.
+- KDE Qt theming step of switchwall errors harmlessly (no kde-material-you-colors).
+- Smoothness of end-4's own animations under interaction still needs user-visual
+  assessment; the render path sustains 46 fps.

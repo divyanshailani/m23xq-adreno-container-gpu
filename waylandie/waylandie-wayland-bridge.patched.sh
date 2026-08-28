@@ -24,6 +24,7 @@ PRESENTATION_TIME_XML="${PRESENTATION_TIME_XML:-/usr/share/wayland-protocols/sta
 VIEWPORTER_XML="${VIEWPORTER_XML:-/usr/share/wayland-protocols/stable/viewporter/viewporter.xml}"
 RELATIVE_POINTER_XML="${RELATIVE_POINTER_XML:-/usr/share/wayland-protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml}"
 POINTER_CONSTRAINTS_XML="${POINTER_CONSTRAINTS_XML:-/usr/share/wayland-protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml}"
+LAYER_SHELL_XML="${LAYER_SHELL_XML:-/root/wlr-layer-shell-unstable-v1.xml}"
 
 have() {
   command -v "$1" >/dev/null 2>&1
@@ -114,6 +115,7 @@ cat >"$tmpdir/wayland-shm-ahb-server.c" <<'EOF'
 #include <X11/extensions/XTest.h>
 #include "xdg-shell-server-protocol.h"
 #include "linux-dmabuf-unstable-v1-server-protocol.h"
+#include "wlr-layer-shell-unstable-v1-server-protocol.h"
 #include "presentation-time-server-protocol.h"
 #include "viewporter-server-protocol.h"
 #include "relative-pointer-unstable-v1-server-protocol.h"
@@ -1910,6 +1912,166 @@ static void bind_xdg_wm_base(struct wl_client *client, void *data, uint32_t vers
         g_xdg_wm_base_resources[g_xdg_wm_base_resource_count++] = resource;
     }
     wl_resource_set_implementation(resource, &xdg_wm_base_impl, NULL, destroy_xdg_wm_base_resource);
+}
+
+/* ---- zwlr_layer_shell_v1: minimal implementation mapped onto the xdg
+ * present path. Each layer surface is marked is_xdg_surface so the
+ * existing commit/present machinery carries its buffers; configure is
+ * sent with the size the client asked for (or the full output). ---- */
+
+struct waylandie_layer_surface_state {
+    struct surface_state *surface;
+    struct wl_resource *resource;
+    int32_t requested_width;
+    int32_t requested_height;
+    int configured;
+};
+
+static void layer_surface_set_size(
+        struct wl_client *client, struct wl_resource *resource, uint32_t width, uint32_t height) {
+    (void)client;
+    struct waylandie_layer_surface_state *layer = wl_resource_get_user_data(resource);
+    if (layer != NULL) {
+        layer->requested_width = (int32_t)width;
+        layer->requested_height = (int32_t)height;
+        /* Pre-first-commit set_size: re-configure so the client can ack the
+         * size it actually asked for and proceed to its first commit. */
+        if (!layer->configured && layer->surface != NULL && layer->surface->server != NULL) {
+            struct server_state *server = layer->surface->server;
+            int32_t cfg_w = width > 0 ? (int32_t)width : server->output_width;
+            int32_t cfg_h = height > 0 ? (int32_t)height : server->output_height;
+            uint32_t serial = wl_display_next_serial(server->display);
+            zwlr_layer_surface_v1_send_configure(layer->resource, serial, cfg_w, cfg_h);
+        }
+    }
+}
+
+static void layer_surface_set_anchor(
+        struct wl_client *client, struct wl_resource *resource, uint32_t anchor) {
+    (void)client; (void)resource; (void)anchor;
+}
+
+static void layer_surface_set_exclusive_zone(
+        struct wl_client *client, struct wl_resource *resource, int32_t zone) {
+    (void)client; (void)resource; (void)zone;
+}
+
+static void layer_surface_set_margin(
+        struct wl_client *client, struct wl_resource *resource,
+        int32_t top, int32_t right, int32_t bottom, int32_t left) {
+    (void)client; (void)resource; (void)top; (void)right; (void)bottom; (void)left;
+}
+
+static void layer_surface_set_keyboard_interactivity(
+        struct wl_client *client, struct wl_resource *resource, uint32_t interactive) {
+    (void)client; (void)resource; (void)interactive;
+}
+
+static void layer_surface_get_popup(
+        struct wl_client *client, struct wl_resource *resource,
+        struct wl_resource *positioner) {
+    (void)client; (void)resource; (void)positioner;
+}
+static void layer_surface_ack_configure(
+        struct wl_client *client, struct wl_resource *resource, uint32_t serial) {
+    (void)client; (void)serial;
+    struct waylandie_layer_surface_state *layer = wl_resource_get_user_data(resource);
+    if (layer != NULL) {
+        layer->configured = 1;
+    }
+}
+
+static void layer_surface_destroy_impl(struct wl_client *client, struct wl_resource *resource) {
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static void layer_surface_set_layer(
+        struct wl_client *client, struct wl_resource *resource, uint32_t layer) {
+    (void)client; (void)resource; (void)layer;
+}
+
+static const struct zwlr_layer_surface_v1_interface layer_surface_impl = {
+    .destroy = layer_surface_destroy_impl,
+    .set_size = layer_surface_set_size,
+    .set_anchor = layer_surface_set_anchor,
+    .set_exclusive_zone = layer_surface_set_exclusive_zone,
+    .set_margin = layer_surface_set_margin,
+    .set_keyboard_interactivity = layer_surface_set_keyboard_interactivity,
+    .get_popup = layer_surface_get_popup,
+    .ack_configure = layer_surface_ack_configure,
+    .set_layer = layer_surface_set_layer,
+};
+
+static void destroy_layer_surface_resource(struct wl_resource *resource) {
+    struct waylandie_layer_surface_state *layer = wl_resource_get_user_data(resource);
+    if (layer != NULL) {
+        if (layer->surface != NULL && layer->surface->server != NULL
+                && layer->surface->server->focused_surface == layer->surface->resource) {
+            layer->surface->server->focused_surface = NULL;
+        }
+        free(layer);
+    }
+}
+
+static void layer_shell_get_layer_surface(
+        struct wl_client *client,
+        struct wl_resource *resource,
+        uint32_t id,
+        struct wl_resource *surface_resource,
+        struct wl_resource *output_resource,
+        uint32_t layer,
+        const char *namespace_) {
+    (void)output_resource; (void)layer; (void)namespace_;
+    struct surface_state *surface = wl_resource_get_user_data(surface_resource);
+    struct wl_resource *layer_resource = wl_resource_create(
+            client, &zwlr_layer_surface_v1_interface, wl_resource_get_version(resource), id);
+    struct waylandie_layer_surface_state *layer_state = calloc(1, sizeof(*layer_state));
+    if (layer_resource == NULL || layer_state == NULL || surface == NULL) {
+        wl_client_post_no_memory(client);
+        free(layer_state);
+        return;
+    }
+    layer_state->surface = surface;
+    layer_state->resource = layer_resource;
+    /* Mark as displayable so the existing commit/present path carries it. */
+    surface->is_xdg_surface = 1;
+    wl_resource_set_implementation(layer_resource, &layer_surface_impl, layer_state, destroy_layer_surface_resource);
+
+    printf("wayland-shm-ahb layer-surface surface=%p\n", (void *)surface);
+    fflush(stdout);
+
+    /* Initial configure: the client's requested size, or full output. */
+    struct server_state *server = surface->server;
+    int32_t cfg_w = layer_state->requested_width;
+    int32_t cfg_h = layer_state->requested_height;
+    if (server != NULL) {
+        if (cfg_w <= 0) cfg_w = server->output_width;
+        if (cfg_h <= 0) cfg_h = server->output_height;
+    }
+    uint32_t serial = server != NULL ? wl_display_next_serial(server->display) : 0;
+    zwlr_layer_surface_v1_send_configure(layer_resource, serial, cfg_w, cfg_h);
+}
+
+static void layer_shell_destroy(struct wl_client *client, struct wl_resource *resource) {
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static const struct zwlr_layer_shell_v1_interface layer_shell_impl = {
+    .destroy = layer_shell_destroy,
+    .get_layer_surface = layer_shell_get_layer_surface,
+};
+
+static void bind_layer_shell(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
+    (void)data;
+    uint32_t bind_version = version > 4 ? 4 : version;
+    struct wl_resource *resource = wl_resource_create(client, &zwlr_layer_shell_v1_interface, bind_version, id);
+    if (resource == NULL) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(resource, &layer_shell_impl, NULL, NULL);
 }
 
 static void destroy_frame_callback_resource(struct wl_resource *resource) {
@@ -3985,7 +4147,8 @@ int main(int argc, char **argv) {
             || wl_global_create(state.display, &wp_viewporter_interface, 1, NULL, bind_viewporter) == NULL
             || wl_global_create(state.display, &zwp_relative_pointer_manager_v1_interface, 1, NULL, bind_relative_pointer_manager) == NULL
             || wl_global_create(state.display, &zwp_pointer_constraints_v1_interface, 1, NULL, bind_pointer_constraints) == NULL
-            || wl_global_create(state.display, &zwp_linux_dmabuf_v1_interface, 4, NULL, bind_linux_dmabuf) == NULL) {
+            || wl_global_create(state.display, &zwp_linux_dmabuf_v1_interface, 4, NULL, bind_linux_dmabuf) == NULL
+            || wl_global_create(state.display, &zwlr_layer_shell_v1_interface, 4, NULL, bind_layer_shell) == NULL) {
         printf("wayland-shm-ahb server=fail reason=globals\n");
         wl_display_destroy(state.display);
         return 1;
@@ -4265,6 +4428,8 @@ wayland-scanner server-header "$RELATIVE_POINTER_XML" "$tmpdir/relative-pointer-
 wayland-scanner private-code "$RELATIVE_POINTER_XML" "$tmpdir/relative-pointer-unstable-v1-protocol.c"
 wayland-scanner server-header "$POINTER_CONSTRAINTS_XML" "$tmpdir/pointer-constraints-unstable-v1-server-protocol.h"
 wayland-scanner private-code "$POINTER_CONSTRAINTS_XML" "$tmpdir/pointer-constraints-unstable-v1-protocol.c"
+wayland-scanner server-header "$LAYER_SHELL_XML" "$tmpdir/wlr-layer-shell-unstable-v1-server-protocol.h"
+wayland-scanner private-code "$LAYER_SHELL_XML" "$tmpdir/wlr-layer-shell-unstable-v1-protocol.c"
 
 cc -Wall -Wextra \
   -o "$tmpdir/wayland-shm-ahb-server" \
@@ -4275,6 +4440,7 @@ cc -Wall -Wextra \
   "$tmpdir/viewporter-protocol.c" \
   "$tmpdir/relative-pointer-unstable-v1-protocol.c" \
   "$tmpdir/pointer-constraints-unstable-v1-protocol.c" \
+  "$tmpdir/wlr-layer-shell-unstable-v1-protocol.c" \
   $(pkg-config --cflags --libs wayland-server x11 xtst)
 
 cc -Wall -Wextra \
