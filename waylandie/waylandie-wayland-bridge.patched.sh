@@ -2505,14 +2505,62 @@ static void send_surface_focus(
         if (!resource_same_client(keyboard->resource, surface_resource)) {
             continue;
         }
-        int keymap_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-        if (keymap_fd >= 0) {
-            wl_keyboard_send_keymap(
-                    keyboard->resource,
-                    WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
-                    keymap_fd,
-                    0);
-            close(keymap_fd);
+        /* Real XKB keymap: eglut-based clients (mesa-demos eglgears/egltri)
+         * assert format == XKB_V1 and abort on NO_KEYMAP. */
+        static char *keymap_cache;
+        static size_t keymap_size;
+        if (keymap_cache == NULL) {
+            const char *km_path = getenv("WAYLANDIE_KEYMAP_FILE");
+            if (km_path == NULL || km_path[0] == '\0') km_path = "/root/keymap.xkb";
+            FILE *kmf = fopen(km_path, "rb");
+            if (kmf != NULL) {
+                fseek(kmf, 0, SEEK_END);
+                long sz = ftell(kmf);
+                fseek(kmf, 0, SEEK_SET);
+                if (sz > 0) {
+                    keymap_cache = malloc((size_t)sz);
+                    if (keymap_cache != NULL &&
+                            fread(keymap_cache, 1, (size_t)sz, kmf) == (size_t)sz) {
+                        keymap_size = (size_t)sz;
+                    } else {
+                        free(keymap_cache);
+                        keymap_cache = NULL;
+                    }
+                }
+                fclose(kmf);
+            }
+        }
+        int sent_keymap = 0;
+        if (keymap_cache != NULL) {
+            int keymap_fd = memfd_create("waylandie-keymap", MFD_CLOEXEC);
+            if (keymap_fd >= 0) {
+                ssize_t total = 0;
+                while (total < (ssize_t)keymap_size) {
+                    ssize_t w = write(keymap_fd, keymap_cache + total, keymap_size - (size_t)total);
+                    if (w <= 0) break;
+                    total += w;
+                }
+                if (total == (ssize_t)keymap_size) {
+                    wl_keyboard_send_keymap(
+                            keyboard->resource,
+                            WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+                            keymap_fd,
+                            keymap_size);
+                    sent_keymap = 1;
+                }
+                close(keymap_fd);
+            }
+        }
+        if (!sent_keymap) {
+            int keymap_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (keymap_fd >= 0) {
+                wl_keyboard_send_keymap(
+                        keyboard->resource,
+                        WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP,
+                        keymap_fd,
+                        0);
+                close(keymap_fd);
+            }
         }
         struct wl_array keys;
         wl_array_init(&keys);
